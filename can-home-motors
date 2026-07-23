@@ -1,0 +1,341 @@
+#!/usr/bin/env python3
+"""
+CANopen Motor Auto-Homing Script
+Homes multiple servo motors over CAN bus using CANopen SDO protocol.
+Each motor runs in its own thread; all share the same CAN interface.
+"""
+
+import can
+import time
+import threading
+import sys
+import argparse
+
+# === CONFIGURATION ===
+# Map motor name -> CANopen Node ID
+MOTORS = {
+    "Front": 2,
+    "Left":  4,
+    "Right": 6,
+}
+
+CAN_INTERFACE   = "can0"
+CAN_BUSTYPE     = "socketcan"
+PROFILE_SPEED   = 200
+PROFILE_SPEED_ENC = 17500 * PROFILE_SPEED   # encoder units per RPM
+TAR_POS_CW      =  20000000
+TAR_POS_CCW     = -20000000
+
+home_values = {}
+stop_event  = threading.Event()
+
+# CANopen SDO COB-IDs
+SDO_TX_BASE = 0x600   # client → server  (our request)
+SDO_RX_BASE = 0x580   # server → client  (drive response)
+
+SDO_READ_RESPONSES = (0x43, 0x4B, 0x4F)   # 4-byte / 2-byte / 1-byte upload responses
+
+
+# ── SDO helpers ────────────────────────────────────────────────────────────────
+
+def _sdo_payload_write(index, subindex, value, size_bytes):
+    """Build an 8-byte SDO download payload."""
+    index_lo = index & 0xFF
+    index_hi = (index >> 8) & 0xFF
+    if size_bytes == 1:
+        cmd  = 0x2F
+        data = list((value & 0xFF).to_bytes(1, 'little')) + [0x00, 0x00, 0x00]
+    elif size_bytes == 2:
+        cmd  = 0x2B
+        data = list((value & 0xFFFF).to_bytes(2, 'little')) + [0x00, 0x00]
+    elif size_bytes == 4:
+        cmd  = 0x23
+        data = list((value & 0xFFFFFFFF).to_bytes(4, 'little'))
+    else:
+        raise ValueError(f"Unsupported SDO size: {size_bytes}")
+    return [cmd, index_lo, index_hi, subindex] + data
+
+
+def send_write_telegram(bus, node_id, index, subindex, value, size_bytes):
+    payload = _sdo_payload_write(index, subindex, value, size_bytes)
+    msg = can.Message(arbitration_id=SDO_TX_BASE + node_id,
+                      data=payload, is_extended_id=False)
+    bus.send(msg)
+    time.sleep(0.05)
+
+
+def send_read_telegram(bus, node_id, index, subindex, timeout=1.0, retries=3):
+    """Send an SDO upload request and return the response Message (or None)."""
+    index_lo    = index & 0xFF
+    index_hi    = (index >> 8) & 0xFF
+    request     = [0x40, index_lo, index_hi, subindex, 0x00, 0x00, 0x00, 0x00]
+    response_id = SDO_RX_BASE + node_id
+
+    for _ in range(retries):
+        msg = can.Message(arbitration_id=SDO_TX_BASE + node_id,
+                          data=request, is_extended_id=False)
+        bus.send(msg)
+        deadline = time.time() + timeout
+        while True:
+            remaining = deadline - time.time()
+            if remaining <= 0:
+                break
+            frame = bus.recv(timeout=remaining)
+            if frame is None:
+                break
+            if (frame.arbitration_id == response_id
+                    and len(frame.data) >= 8
+                    and frame.data[0] in SDO_READ_RESPONSES):
+                return frame
+        time.sleep(0.02)
+    return None
+
+
+def decode_response(response, signed=False):
+    if response is None:
+        return None
+    return int.from_bytes(response.data[4:8], byteorder='little', signed=signed)
+
+
+# ── Drive control ──────────────────────────────────────────────────────────────
+
+def encoder_data_reset(bus, node_id, index, subindex, value):
+    send_write_telegram(bus, node_id, index, subindex, value, 1)
+
+
+def clear_fault(bus, node_id):
+    send_write_telegram(bus, node_id, 0x6040, 0x00, 0x80, 2)
+    time.sleep(0.2)
+    send_write_telegram(bus, node_id, 0x6040, 0x00, 0x06, 2)
+    time.sleep(0.2)
+
+
+def reboot_driver(bus, node_id):
+    send_write_telegram(bus, node_id, 0x6040, 0x00, 0x06, 2)
+    time.sleep(0.2)
+    send_write_telegram(bus, node_id, 0x6040, 0x00, 0x07, 2)
+    time.sleep(0.2)
+    send_write_telegram(bus, node_id, 0x6040, 0x00, 0x00, 2)
+    time.sleep(1)
+    send_write_telegram(bus, node_id, 0x6040, 0x00, 0x06, 2)
+    time.sleep(1)
+
+
+def get_actual_position(bus, node_id):
+    return decode_response(send_read_telegram(bus, node_id, 0x6064, 0x00), signed=True)
+
+def get_error_code(bus, node_id):
+    return decode_response(send_read_telegram(bus, node_id, 0x603F, 0x00))
+
+def get_status_word(bus, node_id):
+    return decode_response(send_read_telegram(bus, node_id, 0x6041, 0x00))
+
+
+def enable_and_save(bus, node_id, name):
+    """After homing: set mode 6, enable drive via standard CW sequence, save params to NVM."""
+    print(f"[{name}] Setting operation mode 6 (Homing mode)...")
+    send_write_telegram(bus, node_id, 0x6060, 0x00, 6, 1)
+    time.sleep(0.2)
+
+    print(f"[{name}] Enabling drive: CW 0x06 -> 0x0F -> 0x1F...")
+    send_write_telegram(bus, node_id, 0x6040, 0x00, 0x06, 2)
+    time.sleep(0.2)
+    send_write_telegram(bus, node_id, 0x6040, 0x00, 0x0F, 2)
+    time.sleep(0.2)
+    send_write_telegram(bus, node_id, 0x6040, 0x00, 0x1F, 2)
+    time.sleep(0.2)
+
+    # CANopen standard store: write ASCII "save" (0x65766173) to 0x1010:01
+    print(f"[{name}] Saving control & motor parameters to NVM...")
+    send_write_telegram(bus, node_id, 0x1010, 0x01, 0x65766173, 4)
+    time.sleep(1.5)   # drives need time to write flash/EEPROM
+    print(f"[{name}] Parameters saved.")
+
+
+def move_to_target(bus, node_id, pos):
+    send_write_telegram(bus, node_id, 0x6060, 0x00, 1, 1)                    # Profile Position mode
+    send_write_telegram(bus, node_id, 0x6081, 0x00, PROFILE_SPEED_ENC, 4)    # Profile velocity
+    send_write_telegram(bus, node_id, 0x607A, 0x00, pos, 4)                  # Target position
+    send_write_telegram(bus, node_id, 0x6040, 0x00, 0x2F, 2)                 # Enable + new setpoint
+    send_write_telegram(bus, node_id, 0x6040, 0x00, 0x3F, 2)                 # Execute move
+
+
+# ── Wait helpers ───────────────────────────────────────────────────────────────
+
+def wait_for_following_error(bus, node_id, name, timeout=300):
+    """
+    Wait until the drive signals a limit was hit (following error / error code),
+    OR the drive drops out of Operation Enabled (target reached without hitting a stop).
+    Returns 'following_error' or 'target_reached'.
+    """
+    deadline = time.time() + timeout
+    was_op_enabled = False
+    while not stop_event.is_set():
+        err = get_error_code(bus, node_id)
+        sw  = get_status_word(bus, node_id)
+
+        if err is not None and sw is not None:
+            op_enabled      = bool(sw & 0x0004)   # bit 2
+            following_error = bool(sw & 0x2000)   # bit 13
+            print(f"  [{name}] StatusWord=0x{sw & 0xFFFF:04X}  ErrorCode=0x{err:04X}")
+
+            if op_enabled:
+                was_op_enabled = True
+
+            if (err != 0) or following_error:
+                print(f"  [{name}] Limit hit (following error): ErrCode=0x{err:04X} SW=0x{sw & 0xFFFF:04X}")
+                return "following_error"
+
+            # Drive left Operation Enabled after having been enabled → move completed without hitting a stop
+            if was_op_enabled and not op_enabled:
+                print(f"  [{name}] Drive stopped at software target (no physical stop found): SW=0x{sw & 0xFFFF:04X}")
+                return "target_reached"
+
+        if time.time() > deadline:
+            print(f"  [{name}] Timeout waiting after {timeout}s — continuing")
+            return "timeout"
+
+        time.sleep(0.3)
+
+
+def wait_for_fault_clear(bus, node_id, name, timeout=120):
+    deadline = time.time() + timeout
+    while not stop_event.is_set():
+        sw = get_status_word(bus, node_id)
+        if sw is not None:
+            fault_bit   = bool(sw & 0x0008)   # bit 3
+            follow_bit  = bool(sw & 0x2000)   # bit 13
+            print(f"  [{name}] Waiting fault clear — StatusWord=0x{sw & 0xFFFF:04X}")
+            if not fault_bit and not follow_bit:
+                print(f"  [{name}] Fault cleared (SW=0x{sw & 0xFFFF:04X}), proceeding")
+                return
+        if time.time() > deadline:
+            print(f"  [{name}] Timeout waiting for fault clear after {timeout}s — continuing")
+            return
+        time.sleep(0.5)
+
+
+# ── Homing sequence ────────────────────────────────────────────────────────────
+
+def home_motor(name, node_id, interface, bustype):
+    """Full homing sequence for one motor.  Runs in its own thread with its own bus socket."""
+    try:
+        # Each thread gets its own socket so recv() is independent per node.
+        with can.interface.Bus(interface=bustype, channel=interface) as bus:
+            print(f"[{name}] Connected on {interface}, node ID {node_id}")
+            print(f"[{name}] Rebooting driver to clear previous errors...")
+            reboot_driver(bus, node_id)
+
+            # ── CW sweep ──
+            move_to_target(bus, node_id, TAR_POS_CW)
+            print(f"[{name}] Moving to CW limit...")
+            wait_for_following_error(bus, node_id, name)
+            clear_fault(bus, node_id)
+            print(f"[{name}] Fault cleared after CW")
+            wait_for_fault_clear(bus, node_id, name)
+            if stop_event.is_set():
+                return
+            a = get_actual_position(bus, node_id)
+            print(f"[{name}] CW position (a): {a}")
+
+            # ── CCW sweep ──
+            move_to_target(bus, node_id, TAR_POS_CCW)
+            print(f"[{name}] Moving to CCW limit...")
+            wait_for_following_error(bus, node_id, name)
+            clear_fault(bus, node_id)
+            print(f"[{name}] Fault cleared after CCW")
+            wait_for_fault_clear(bus, node_id, name)
+            if stop_event.is_set():
+                return
+            b = get_actual_position(bus, node_id)
+            print(f"[{name}] CCW position (b): {b}")
+
+            # ── Midpoint ──
+            mid = (a + b) // 2
+            print(f"[{name}] Midpoint (a+b)/2: {mid}")
+            move_to_target(bus, node_id, mid)
+            while not stop_event.is_set():
+                pos = get_actual_position(bus, node_id)
+                if pos is not None and pos == mid:
+                    print(f"[{name}] Reached midpoint: {pos}")
+                    break
+                time.sleep(0.5)
+
+            if stop_event.is_set():
+                return
+
+            # ── Encoder reset ──
+            reboot_driver(bus, node_id)
+            print(f"[{name}] Rebooting & resetting encoder...")
+            encoder_data_reset(bus, node_id, 0x2690, 0x00, 10)
+            print(f"[{name}] Encoder reset done")
+            wait_for_fault_clear(bus, node_id, name)
+            if stop_event.is_set():
+                return
+
+            home_val = get_actual_position(bus, node_id)
+            home_values[name] = home_val
+            print(f"[{name}] Home value set to: {home_val}")
+            enable_and_save(bus, node_id, name)
+
+    except Exception as e:
+        print(f"[{name}] Error: {e}")
+
+
+# ── Entry point ────────────────────────────────────────────────────────────────
+
+def main():
+    parser = argparse.ArgumentParser(
+        description="CANopen motor auto-homing over CAN bus",
+        formatter_class=argparse.ArgumentDefaultsHelpFormatter,
+    )
+    parser.add_argument("--interface", "-i", default=CAN_INTERFACE,
+                        help="CAN interface name")
+    parser.add_argument("--bustype",   "-b", default=CAN_BUSTYPE,
+                        help="python-can bus type")
+    parser.add_argument("--motors",    "-m", nargs="*",
+                        help="Subset of motors to home (e.g. Front Left). "
+                             "Defaults to all configured motors.")
+    args = parser.parse_args()
+
+    motors_to_run = {
+        name: nid for name, nid in MOTORS.items()
+        if args.motors is None or name in args.motors
+    }
+    if not motors_to_run:
+        print(f"No matching motors found. Available: {list(MOTORS.keys())}")
+        sys.exit(1)
+
+    print(f"Interface : {args.interface}  ({args.bustype})")
+    print(f"Motors    : {list(motors_to_run.keys())}\n")
+
+    threads = []
+    try:
+        for name, node_id in motors_to_run.items():
+            t = threading.Thread(
+                target=home_motor,
+                args=(name, node_id, args.interface, args.bustype),
+                daemon=True,
+            )
+            threads.append(t)
+            t.start()
+
+        while any(t.is_alive() for t in threads):
+            time.sleep(0.5)
+
+    except KeyboardInterrupt:
+        print("\nKeyboard interrupt — stopping all motors...")
+        stop_event.set()
+        for t in threads:
+            t.join(timeout=5)
+        print("All threads exited safely.")
+        sys.exit(0)
+
+    print("\nAll motors homed.")
+    print("\n===== Final Home Values =====")
+    for name in motors_to_run:
+        print(f"  {name}: {home_values.get(name, 'N/A')}")
+
+
+if __name__ == "__main__":
+    main()

@@ -1,0 +1,320 @@
+#!/usr/bin/env python3
+"""
+liftkit_pid_config.py — Interactive PID gain configurator for the liftkit drive.
+
+Configures gains one by one via CAN SDO on can1, node 7:
+
+  Step  Parameter       OD           Description
+  ────  ─────────────   ──────────   ──────────────────────────────────────
+  1     Kvp             0x60F9:01    Velocity proportional gain
+  2     Kvi             0x60F9:03    Velocity integral gain
+  3     Kvi_Sum_Limit   0x60F9:0C    Velocity integrator anti-windup cap
+  4     Speed_Fb_N      0x60F9:05    Velocity feedback filter coefficient
+  5     Kpp             0x60FB:01    Position proportional gain
+  6     Kvff            0x2FF0:1A    Velocity feed-forward
+
+Design constraints (enforced as reminders):
+  - Filter BW  ≥  2 × Velocity loop BW   (avoids oscillation)
+  - Kpp target  <  ¼ × Velocity loop BW  (position BW < velocity BW)
+
+Usage:
+  python3 liftkit_pid_config.py [--iface can1] [--node 7]
+"""
+
+import argparse
+import socket
+import struct
+import sys
+import time
+
+# ── CAN frame constants ───────────────────────────────────────────────────────
+
+CAN_FRAME_FMT = '=IB3x8s'
+FRAME_SZ      = struct.calcsize(CAN_FRAME_FMT)
+NMT_PRE_OP    = 0x80
+NMT_START     = 0x01
+
+# ── Parameter table ───────────────────────────────────────────────────────────
+# (name, index, subindex, label, post_set_note)
+
+_PARAMS = [
+    (
+        'Kvp', 0x60F9, 0x01,
+        'Velocity proportional gain (Kvp)',
+        'NOTE: Filter BW must be ≥ 2× your velocity loop BW to avoid oscillation.\n'
+        '      Velocity loop BW (Hz) ≈ Kvp / (2π × load_inertia)  [drive-specific scaling]\n'
+        '      Set your filter accordingly before closing the loop.',
+    ),
+    (
+        'Kvi', 0x60F9, 0x03,
+        'Velocity integral gain (Kvi)',
+        'Kvi eliminates steady-state error. Increase gradually — too high causes overshoot.',
+    ),
+    (
+        'Kvi_Sum_Limit', 0x60F9, 0x0C,
+        'Velocity integrator anti-windup cap (Kvi_Sum_Limit)',
+        'Caps the integrator accumulation to prevent current saturation on large errors.',
+    ),
+    (
+        'Speed_Fb_N', 0x60F9, 0x05,
+        'Velocity feedback filter coefficient (Speed_Fb_N)',
+        'Low-pass filter on the velocity feedback signal.\n'
+        '      Higher value = more filtering (smoother but slower response).\n'
+        '      NOTE: Filter BW must be ≥ 2× velocity loop BW to avoid phase lag instability.',
+    ),
+    (
+        'Kpp', 0x60FB, 0x01,
+        'Position proportional gain (Kpp)',
+        'NOTE: Position loop BW must be < ¼ × Velocity loop BW.\n'
+        '      Too high Kpp relative to Kvp will cause the position loop to excite\n'
+        '      velocity resonance and produce oscillation.',
+    ),
+    (
+        'Kvff', 0x2FF0, 0x1A,
+        'Velocity feed-forward (Kvff)',
+        'Reduces following error during motion. Typical starting value: 1000 (100% FF).\n'
+        '      Too high causes overshoot on accelerations.',
+    ),
+]
+
+# ── ANSI ──────────────────────────────────────────────────────────────────────
+
+_IS_TTY = sys.stdout.isatty()
+
+def _bold(s):   return f'\033[1m{s}\033[0m'   if _IS_TTY else s
+def _cyan(s):   return f'\033[36m{s}\033[0m'  if _IS_TTY else s
+def _green(s):  return f'\033[32m{s}\033[0m'  if _IS_TTY else s
+def _yellow(s): return f'\033[33m{s}\033[0m'  if _IS_TTY else s
+def _red(s):    return f'\033[31m{s}\033[0m'  if _IS_TTY else s
+
+# ── CAN helpers ───────────────────────────────────────────────────────────────
+
+def open_can_socket(iface):
+    sock = socket.socket(socket.AF_CAN, socket.SOCK_RAW, socket.CAN_RAW)
+    sock.bind((iface,))
+    sock.settimeout(0.5)
+    return sock
+
+
+def send_nmt(sock, command, node_id):
+    payload = struct.pack('BB6x', command, node_id)
+    sock.send(struct.pack('=IB3x8s', 0x000, 2, payload))
+
+
+def sdo_read(sock, node_id, index, subindex, timeout=0.5):
+    """
+    Expedited SDO upload. Returns (value: int, n_bytes: int) or (None, None).
+    n_bytes reflects the actual data width reported by the drive's response cmd byte.
+    """
+    cob_req  = 0x600 + node_id
+    cob_resp = 0x580 + node_id
+    req = struct.pack('<BHBB4x', 0x40, index, subindex, 0)
+    try:
+        sock.send(struct.pack('=IB3x8s', cob_req, 8, req))
+    except OSError as exc:
+        print(_red(f'  [send error] {exc}'))
+        return None, None
+    deadline = time.monotonic() + timeout
+    while time.monotonic() < deadline:
+        try:
+            raw = sock.recv(FRAME_SZ)
+            rid, _dlc, rdata = struct.unpack(CAN_FRAME_FMT, raw)
+            if (rid & 0x1FFFFFFF) != cob_resp:
+                continue
+            if rdata[0] == 0x80:
+                abort = struct.unpack_from('<I', rdata, 4)[0]
+                print(_red(f'  [SDO abort] 0x{abort:08X}'))
+                return None, None
+            cmd     = rdata[0]
+            n_bytes = 4 - ((cmd >> 2) & 0x03) if (cmd & 0x02) else 4
+            value   = int.from_bytes(rdata[4:4 + n_bytes], 'little', signed=True)
+            return value, n_bytes
+        except socket.timeout:
+            pass
+    print(_red(f'  [timeout] no SDO response for 0x{index:04X}:{subindex:02X}'))
+    return None, None
+
+
+def sdo_write(sock, node_id, index, subindex, value, n_bytes, timeout=0.5):
+    """
+    Expedited SDO download. n_bytes = 1/2/4 (INT8/INT16/INT32).
+    Returns True on ack, False on abort/timeout.
+    """
+    cmd_map = {1: 0x2F, 2: 0x2B, 4: 0x23}
+    cmd = cmd_map.get(n_bytes, 0x23)
+
+    cob_req  = 0x600 + node_id
+    cob_resp = 0x580 + node_id
+    data = value.to_bytes(n_bytes, 'little', signed=(value < 0))
+    data = data.ljust(4, b'\x00')
+    req = struct.pack('<BHB4s', cmd, index, subindex, data)
+    try:
+        sock.send(struct.pack('=IB3x8s', cob_req, 8, req))
+    except OSError as exc:
+        print(_red(f'  [send error] {exc}'))
+        return False
+    deadline = time.monotonic() + timeout
+    while time.monotonic() < deadline:
+        try:
+            raw = sock.recv(FRAME_SZ)
+            rid, _dlc, rdata = struct.unpack(CAN_FRAME_FMT, raw)
+            if (rid & 0x1FFFFFFF) != cob_resp:
+                continue
+            if rdata[0] == 0x80:
+                abort = struct.unpack_from('<I', rdata, 4)[0]
+                print(_red(f'  [SDO abort] 0x{abort:08X}'))
+                return False
+            if rdata[0] == 0x60:
+                return True
+        except socket.timeout:
+            pass
+    print(_red(f'  [timeout] no ack for write to 0x{index:04X}:{subindex:02X}'))
+    return False
+
+
+def save_params(sock, node_id):
+    """Write 'evas' (0x65766173) to 0x1010:01 to trigger non-volatile save."""
+    print('  Saving parameters to non-volatile memory (0x1010:01)...')
+    ok = sdo_write(sock, node_id, 0x1010, 0x01, 0x65766173, 4)
+    if ok:
+        time.sleep(0.5)  # drive may need time to write flash
+        print(_green('  Parameters saved.'))
+    else:
+        print(_yellow('  Save command not acknowledged — parameters may be volatile.'))
+    return ok
+
+# ── Main configurator ─────────────────────────────────────────────────────────
+
+def configure(iface, node_id):
+    print()
+    print(_bold('═' * 60))
+    print(_bold('  Liftkit PID Configurator'))
+    print(_bold(f'  Interface: {iface}   Node: {node_id}'))
+    print(_bold('═' * 60))
+    print()
+
+    try:
+        sock = open_can_socket(iface)
+    except OSError as exc:
+        print(_red(f'Cannot open {iface}: {exc}'))
+        sys.exit(1)
+
+    # Put node in Pre-Operational so SDO works and drive is not running
+    send_nmt(sock, NMT_PRE_OP, node_id)
+    time.sleep(0.1)
+    print(f'  Node {node_id} → NMT Pre-Operational')
+    print()
+
+    changes = []   # (name, index, subindex, old_val, new_val, n_bytes)
+
+    for step, (name, index, subindex, label, note) in enumerate(_PARAMS, 1):
+
+        print(_bold(f'─── Step {step}/6  {label} ───────────────────'))
+        print(f'    OD: 0x{index:04X}:{subindex:02X}')
+        print()
+
+        # Read current value
+        cur_val, n_bytes = sdo_read(sock, node_id, index, subindex)
+        if cur_val is None:
+            print(_yellow('    Could not read current value — drive may not respond for this object.'))
+            n_bytes = 4   # default to INT32 for write
+            cur_display = 'unknown'
+        else:
+            cur_display = str(cur_val)
+            print(f'    Current value : {_cyan(cur_display)}  ({n_bytes}-byte field)')
+
+        # Prompt for new value
+        try:
+            raw = input(f'    New value (Enter to keep {cur_display}): ').strip()
+        except (EOFError, KeyboardInterrupt):
+            print()
+            print(_yellow('\nAborted.'))
+            break
+
+        if raw == '':
+            print(_yellow('    → Keeping current value.'))
+            print()
+            continue
+
+        try:
+            new_val = int(raw)
+        except ValueError:
+            print(_red(f'    Invalid integer "{raw}" — skipping this parameter.'))
+            print()
+            continue
+
+        # Write new value
+        print(f'    Writing {new_val} → 0x{index:04X}:{subindex:02X}...')
+        ok = sdo_write(sock, node_id, index, subindex, new_val, n_bytes)
+
+        if not ok:
+            print(_red('    Write failed.'))
+            print()
+            continue
+
+        # Read back to confirm
+        readback, _ = sdo_read(sock, node_id, index, subindex)
+        if readback is None:
+            print(_yellow('    Write ack received but readback failed — value may have been written.'))
+        elif readback == new_val:
+            print(_green(f'    ✓ Confirmed: {readback}'))
+        else:
+            print(_yellow(f'    ⚠ Readback mismatch: wrote {new_val}, read {readback}'))
+
+        changes.append((name, index, subindex, cur_val, new_val, n_bytes))
+
+        # Post-set guidance
+        if note:
+            print()
+            for line in note.splitlines():
+                print(f'    {_yellow(line)}')
+
+        print()
+
+    # ── Summary ──────────────────────────────────────────────────────────────
+    print(_bold('═' * 60))
+    print(_bold('  Summary of Changes'))
+    print(_bold('═' * 60))
+
+    if not changes:
+        print('  No parameters were changed.')
+    else:
+        col = max(len(n) for n, *_ in changes)
+        for name, index, subindex, old_val, new_val, _ in changes:
+            old_s = str(old_val) if old_val is not None else 'unknown'
+            print(f'  {name:<{col}}  0x{index:04X}:{subindex:02X}  '
+                  f'{old_s} → {_green(str(new_val))}')
+
+    print()
+
+    # ── Optional save ────────────────────────────────────────────────────────
+    if changes:
+        try:
+            save_ans = input('  Save parameters to non-volatile memory? (y/N): ').strip().lower()
+        except (EOFError, KeyboardInterrupt):
+            save_ans = 'n'
+        if save_ans == 'y':
+            save_params(sock, node_id)
+        else:
+            print(_yellow('  Parameters NOT saved — will revert on power cycle.'))
+        print()
+
+    sock.close()
+    print('Done.')
+    print()
+
+
+# ── Entry point ───────────────────────────────────────────────────────────────
+
+def main():
+    parser = argparse.ArgumentParser(
+        description='Interactive liftkit PID configurator via CAN SDO')
+    parser.add_argument('--iface', default='can1', help='CAN interface (default: can1)')
+    parser.add_argument('--node',  type=int, default=7, help='CANopen node ID (default: 7)')
+    args = parser.parse_args()
+    configure(args.iface, args.node)
+
+
+if __name__ == '__main__':
+    main()
+

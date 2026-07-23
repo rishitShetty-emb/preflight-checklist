@@ -1,0 +1,365 @@
+#!/usr/bin/env python3
+"""
+amr_pid_tune — Interactive PID gain configurator for the AMR travel motors.
+
+Configures gains for all three drive-wheel nodes on can0 (nodes 1, 3, 5) at
+once: you enter each gain a single time and it is written to all three nodes so
+they stay identical. Mirrors liftkit_pid_tune, extended to fan out across the
+travel motors.
+
+  Step  Parameter       OD           Description
+  ────  ─────────────   ──────────   ──────────────────────────────────────
+  1     Kvp             0x60F9:01    Velocity proportional gain
+  2     Kvi             0x60F9:03    Velocity integral gain
+  3     Kvi_Sum_Limit   0x60F9:0C    Velocity integrator anti-windup cap
+  4     Speed_Fb_N      0x60F9:05    Velocity feedback filter coefficient
+  5     Kpp             0x60FB:01    Position proportional gain
+  6     Kvff            0x2FF0:1A    Velocity feed-forward
+
+Design constraints (enforced as reminders):
+  - Filter BW  ≥  2 × Velocity loop BW   (avoids oscillation)
+  - Kpp target  <  ¼ × Velocity loop BW  (position BW < velocity BW)
+
+Usage:
+  python3 amr_pid_tune [--iface can0] [--nodes 1 3 5]
+"""
+
+import argparse
+import socket
+import struct
+import sys
+import time
+
+# ── CAN frame constants ───────────────────────────────────────────────────────
+
+CAN_FRAME_FMT = '=IB3x8s'
+FRAME_SZ      = struct.calcsize(CAN_FRAME_FMT)
+NMT_PRE_OP    = 0x80
+NMT_START     = 0x01
+
+# ── Defaults ──────────────────────────────────────────────────────────────────
+# Travel-motor (drive wheel) node IDs on can0 — nodes 2/4/6 are steering and are
+# intentionally left untouched.
+
+DEFAULT_IFACE = 'can0'
+DEFAULT_NODES = [1, 3, 5]
+
+# ── Parameter table ───────────────────────────────────────────────────────────
+# (name, index, subindex, label, post_set_note)
+
+_PARAMS = [
+    (
+        'Kvp', 0x60F9, 0x01,
+        'Velocity proportional gain (Kvp)',
+        'NOTE: Filter BW must be ≥ 2× your velocity loop BW to avoid oscillation.\n'
+        '      Velocity loop BW (Hz) ≈ Kvp / (2π × load_inertia)  [drive-specific scaling]\n'
+        '      Set your filter accordingly before closing the loop.',
+    ),
+    (
+        'Kvi', 0x60F9, 0x03,
+        'Velocity integral gain (Kvi)',
+        'Kvi eliminates steady-state error. Increase gradually — too high causes overshoot.',
+    ),
+    (
+        'Kvi_Sum_Limit', 0x60F9, 0x0C,
+        'Velocity integrator anti-windup cap (Kvi_Sum_Limit)',
+        'Caps the integrator accumulation to prevent current saturation on large errors.',
+    ),
+    (
+        'Speed_Fb_N', 0x60F9, 0x05,
+        'Velocity feedback filter coefficient (Speed_Fb_N)',
+        'Low-pass filter on the velocity feedback signal.\n'
+        '      Higher value = more filtering (smoother but slower response).\n'
+        '      NOTE: Filter BW must be ≥ 2× velocity loop BW to avoid phase lag instability.',
+    ),
+    (
+        'Kpp', 0x60FB, 0x01,
+        'Position proportional gain (Kpp)',
+        'NOTE: Position loop BW must be < ¼ × Velocity loop BW.\n'
+        '      Too high Kpp relative to Kvp will cause the position loop to excite\n'
+        '      velocity resonance and produce oscillation.',
+    ),
+    (
+        'Kvff', 0x2FF0, 0x1A,
+        'Velocity feed-forward (Kvff)',
+        'Reduces following error during motion. Typical starting value: 1000 (100% FF).\n'
+        '      Too high causes overshoot on accelerations.',
+    ),
+]
+
+# ── ANSI ──────────────────────────────────────────────────────────────────────
+
+_IS_TTY = sys.stdout.isatty()
+
+def _bold(s):   return f'\033[1m{s}\033[0m'   if _IS_TTY else s
+def _cyan(s):   return f'\033[36m{s}\033[0m'  if _IS_TTY else s
+def _green(s):  return f'\033[32m{s}\033[0m'  if _IS_TTY else s
+def _yellow(s): return f'\033[33m{s}\033[0m'  if _IS_TTY else s
+def _red(s):    return f'\033[31m{s}\033[0m'  if _IS_TTY else s
+
+# ── CAN helpers ───────────────────────────────────────────────────────────────
+
+def open_can_socket(iface):
+    sock = socket.socket(socket.AF_CAN, socket.SOCK_RAW, socket.CAN_RAW)
+    sock.bind((iface,))
+    sock.settimeout(0.5)
+    return sock
+
+
+def send_nmt(sock, command, node_id):
+    payload = struct.pack('BB6x', command, node_id)
+    sock.send(struct.pack('=IB3x8s', 0x000, 2, payload))
+
+
+def sdo_read(sock, node_id, index, subindex, timeout=0.5):
+    """
+    Expedited SDO upload. Returns (value: int, n_bytes: int) or (None, None).
+    n_bytes reflects the actual data width reported by the drive's response cmd byte.
+    """
+    cob_req  = 0x600 + node_id
+    cob_resp = 0x580 + node_id
+    req = struct.pack('<BHBB4x', 0x40, index, subindex, 0)
+    try:
+        sock.send(struct.pack('=IB3x8s', cob_req, 8, req))
+    except OSError as exc:
+        print(_red(f'  [send error] {exc}'))
+        return None, None
+    deadline = time.monotonic() + timeout
+    while time.monotonic() < deadline:
+        try:
+            raw = sock.recv(FRAME_SZ)
+            rid, _dlc, rdata = struct.unpack(CAN_FRAME_FMT, raw)
+            if (rid & 0x1FFFFFFF) != cob_resp:
+                continue
+            if rdata[0] == 0x80:
+                abort = struct.unpack_from('<I', rdata, 4)[0]
+                print(_red(f'  [node {node_id} SDO abort] 0x{abort:08X}'))
+                return None, None
+            cmd     = rdata[0]
+            n_bytes = 4 - ((cmd >> 2) & 0x03) if (cmd & 0x02) else 4
+            value   = int.from_bytes(rdata[4:4 + n_bytes], 'little', signed=True)
+            return value, n_bytes
+        except socket.timeout:
+            pass
+    print(_red(f'  [node {node_id} timeout] no SDO response for 0x{index:04X}:{subindex:02X}'))
+    return None, None
+
+
+def sdo_write(sock, node_id, index, subindex, value, n_bytes, timeout=0.5):
+    """
+    Expedited SDO download. n_bytes = 1/2/4 (INT8/INT16/INT32).
+    Returns True on ack, False on abort/timeout.
+    """
+    cmd_map = {1: 0x2F, 2: 0x2B, 4: 0x23}
+    cmd = cmd_map.get(n_bytes, 0x23)
+
+    cob_req  = 0x600 + node_id
+    cob_resp = 0x580 + node_id
+    data = value.to_bytes(n_bytes, 'little', signed=(value < 0))
+    data = data.ljust(4, b'\x00')
+    req = struct.pack('<BHB4s', cmd, index, subindex, data)
+    try:
+        sock.send(struct.pack('=IB3x8s', cob_req, 8, req))
+    except OSError as exc:
+        print(_red(f'  [node {node_id} send error] {exc}'))
+        return False
+    deadline = time.monotonic() + timeout
+    while time.monotonic() < deadline:
+        try:
+            raw = sock.recv(FRAME_SZ)
+            rid, _dlc, rdata = struct.unpack(CAN_FRAME_FMT, raw)
+            if (rid & 0x1FFFFFFF) != cob_resp:
+                continue
+            if rdata[0] == 0x80:
+                abort = struct.unpack_from('<I', rdata, 4)[0]
+                print(_red(f'  [node {node_id} SDO abort] 0x{abort:08X}'))
+                return False
+            if rdata[0] == 0x60:
+                return True
+        except socket.timeout:
+            pass
+    print(_red(f'  [node {node_id} timeout] no ack for write to 0x{index:04X}:{subindex:02X}'))
+    return False
+
+
+def save_params(sock, nodes):
+    """Write 'evas' (0x65766173) to 0x1010:01 on every node to trigger NVM save."""
+    print('  Saving parameters to non-volatile memory (0x1010:01)...')
+    for nid in nodes:
+        ok = sdo_write(sock, nid, 0x1010, 0x01, 0x65766173, 4)
+        if ok:
+            time.sleep(0.5)  # drive may need time to write flash
+            print(_green(f'    node {nid}: parameters saved.'))
+        else:
+            print(_yellow(f'    node {nid}: save command not acknowledged — parameters may be volatile.'))
+
+# ── Formatting helpers ──────────────────────────────────────────────────────────
+
+def _fmt_currents(nodes, cur_vals):
+    """Render 'n1=1200  n3=1200  n5=N/A' from a {nid: value|None} map."""
+    parts = []
+    for nid in nodes:
+        v = cur_vals.get(nid)
+        parts.append(f'n{nid}={v if v is not None else "N/A"}')
+    return '  '.join(parts)
+
+
+def _values_uniform(nodes, cur_vals):
+    """True if every responding node reports the same value (ignores non-responders)."""
+    present = [cur_vals[nid] for nid in nodes if cur_vals.get(nid) is not None]
+    return len(set(present)) <= 1
+
+# ── Main configurator ─────────────────────────────────────────────────────────
+
+def configure(iface, nodes):
+    print()
+    print(_bold('═' * 60))
+    print(_bold('  AMR Travel-Motor PID Configurator'))
+    print(_bold(f'  Interface: {iface}   Nodes: {", ".join(str(n) for n in nodes)}'))
+    print(_bold('═' * 60))
+    print()
+
+    try:
+        sock = open_can_socket(iface)
+    except OSError as exc:
+        print(_red(f'Cannot open {iface}: {exc}'))
+        sys.exit(1)
+
+    # Put every target node in Pre-Operational so SDO works and drives are idle.
+    for nid in nodes:
+        send_nmt(sock, NMT_PRE_OP, nid)
+    time.sleep(0.1)
+    print(f'  Nodes {", ".join(str(n) for n in nodes)} → NMT Pre-Operational')
+    print()
+
+    # changes: (name, index, subindex, {nid: old_val}, new_val, {nid: ok})
+    changes = []
+
+    for step, (name, index, subindex, label, note) in enumerate(_PARAMS, 1):
+
+        print(_bold(f'─── Step {step}/{len(_PARAMS)}  {label} ───────────────────'))
+        print(f'    OD: 0x{index:04X}:{subindex:02X}')
+        print()
+
+        # ── Read current value from every node ────────────────────────────────
+        cur_vals   = {}   # nid -> value | None
+        width_seen = None
+        for nid in nodes:
+            val, nb = sdo_read(sock, nid, index, subindex)
+            cur_vals[nid] = val
+            if nb is not None and width_seen is None:
+                width_seen = nb   # first responding node dictates the write width
+
+        n_bytes = width_seen if width_seen is not None else 4  # default INT32
+        print(f'    Current values : {_cyan(_fmt_currents(nodes, cur_vals))}'
+              f'  ({n_bytes}-byte field)')
+        if not _values_uniform(nodes, cur_vals):
+            print(_yellow('    ⚠ Nodes are NOT uniform for this parameter.'))
+
+        # ── Prompt once for the value applied to all nodes ────────────────────
+        try:
+            raw = input('    New value for ALL nodes (Enter to leave unchanged): ').strip()
+        except (EOFError, KeyboardInterrupt):
+            print()
+            print(_yellow('\nAborted.'))
+            break
+
+        if raw == '':
+            if _values_uniform(nodes, cur_vals):
+                print(_yellow('    → Leaving current value unchanged.'))
+            else:
+                print(_yellow('    → Left UNCHANGED — nodes remain non-uniform for this gain.'))
+            print()
+            continue
+
+        try:
+            new_val = int(raw)
+        except ValueError:
+            print(_red(f'    Invalid integer "{raw}" — skipping this parameter.'))
+            print()
+            continue
+
+        # ── Write to every node ───────────────────────────────────────────────
+        print(f'    Writing {new_val} → 0x{index:04X}:{subindex:02X} on all nodes...')
+        write_ok = {}
+        for nid in nodes:
+            ok = sdo_write(sock, nid, index, subindex, new_val, n_bytes)
+            write_ok[nid] = ok
+            if not ok:
+                print(_red(f'      node {nid}: write FAILED'))
+
+        # ── Read back from every node to confirm ──────────────────────────────
+        confirm_parts = []
+        for nid in nodes:
+            readback, _ = sdo_read(sock, nid, index, subindex)
+            if readback is None:
+                confirm_parts.append(_yellow(f'n{nid}=? (readback failed)'))
+            elif readback == new_val:
+                confirm_parts.append(_green(f'n{nid} ✓'))
+            else:
+                confirm_parts.append(_yellow(f'n{nid}⚠ read {readback}'))
+        print(f'    Readback: {"  ".join(confirm_parts)}')
+
+        changes.append((name, index, subindex, dict(cur_vals), new_val, dict(write_ok)))
+
+        # ── Post-set guidance ─────────────────────────────────────────────────
+        if note:
+            print()
+            for line in note.splitlines():
+                print(f'    {_yellow(line)}')
+
+        print()
+
+    # ── Summary ────────────────────────────────────────────────────────────────
+    print(_bold('═' * 60))
+    print(_bold('  Summary of Changes'))
+    print(_bold('═' * 60))
+
+    if not changes:
+        print('  No parameters were changed.')
+    else:
+        col = max(len(n) for n, *_ in changes)
+        for name, index, subindex, _old, new_val, write_ok in changes:
+            flags = '  '.join(
+                (_green(f'n{nid} ✓') if write_ok.get(nid) else _red(f'n{nid} ✗'))
+                for nid in nodes
+            )
+            print(f'  {name:<{col}}  0x{index:04X}:{subindex:02X}  '
+                  f'→ {_green(str(new_val))}   [{flags}]')
+
+    print()
+
+    # ── Optional save ────────────────────────────────────────────────────────
+    if changes:
+        try:
+            save_ans = input('  Save parameters to non-volatile memory on all nodes? (y/N): ').strip().lower()
+        except (EOFError, KeyboardInterrupt):
+            save_ans = 'n'
+        if save_ans == 'y':
+            save_params(sock, nodes)
+        else:
+            print(_yellow('  Parameters NOT saved — will revert on power cycle.'))
+        print()
+
+    sock.close()
+    print('Done.')
+    print()
+
+
+# ── Entry point ───────────────────────────────────────────────────────────────
+
+def main():
+    parser = argparse.ArgumentParser(
+        description='Interactive AMR travel-motor PID configurator via CAN SDO '
+                    '(writes identical values to all nodes)')
+    parser.add_argument('--iface', default=DEFAULT_IFACE,
+                        help=f'CAN interface (default: {DEFAULT_IFACE})')
+    parser.add_argument('--nodes', type=int, nargs='+', default=DEFAULT_NODES,
+                        metavar='ID',
+                        help=f'CANopen node IDs (default: {" ".join(map(str, DEFAULT_NODES))})')
+    args = parser.parse_args()
+    configure(args.iface, args.nodes)
+
+
+if __name__ == '__main__':
+    main()

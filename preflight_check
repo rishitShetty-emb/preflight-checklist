@@ -1,0 +1,1817 @@
+#!/usr/bin/env python3
+"""Actuation Pre-flight Check — standalone, no ROS2 dependency."""
+
+import argparse
+import math
+import socket
+import struct
+import subprocess
+import sys
+import threading
+import time
+
+# ── ANSI helpers ──────────────────────────────────────────────────────────────
+
+_USE_COLOR = sys.stdout.isatty()
+
+def _green(s): return f"\033[32m{s}\033[0m" if _USE_COLOR else s
+def _red(s):   return f"\033[31m{s}\033[0m" if _USE_COLOR else s
+
+PASS  = _green("✓")
+FAIL  = _red("✗")
+TITLE = "Actuation Pre-flight Check"
+
+# ── CAN frame format ──────────────────────────────────────────────────────────
+
+CAN_FRAME_FMT = '=IB3x8s'
+FRAME_SZ = struct.calcsize(CAN_FRAME_FMT)
+
+# ── NMT commands ──────────────────────────────────────────────────────────────
+
+NMT_START    = 0x01   # → Operational
+NMT_STOP     = 0x02   # → Stopped
+NMT_PRE_OP   = 0x80   # → Pre-Operational (SDO works, PDO silent)
+
+# ── CAN timing test constants ─────────────────────────────────────────────────
+
+SYNC_INTERVAL_US = 2_000          # 500 Hz
+TEST_DURATION_S  = 5.0
+TPDO_COLLECT_US  = 1_500          # spin-read window after each SYNC
+RPDO1_BASE       = 0x200
+TPDO1_BASE       = 0x180
+
+_SYNC_FRAME = struct.pack('=IB3x8s', 0x080, 0, bytes(8))
+
+def _rpdo_frame(node_id):
+    return struct.pack('=IB3x8s', RPDO1_BASE + node_id, 8, bytes(8))
+
+def _precise_sleep_until(target_ns):
+    """Hybrid sleep: OS yield for coarse portion, busy-wait for last 300 µs."""
+    while True:
+        slack = target_ns - time.monotonic_ns()
+        if slack <= 0:
+            break
+        if slack > 500_000:
+            time.sleep(slack / 2e9)
+
+# ── AMR node map ──────────────────────────────────────────────────────────────
+
+AMR_NODES = {
+    1: 'wheel_f',
+    2: 'steering_f',
+    3: 'wheel_rl',
+    4: 'steering_rl',
+    5: 'wheel_rr',
+    6: 'steering_rr',
+}
+REQUIRED_STEERING_NODES = {2, 4, 6}
+
+# ── PDO layouts (from amr_bus.yml / liftkit_bus.yml) ─────────────────────────
+# Each mapping entry: (index, subindex, bits).
+# Mirrors staging_offset:: constants in motor_enums.hpp.
+
+# TPDO1 — 500 Hz (tx_type=0x01), every SYNC
+# staging_offset::kVelocity(0) + kPosition(1)
+_MOTOR_TPDO1 = [
+    (0x606C, 0, 32),      # Velocity Actual Value      (int32) — cached_vel_raw_
+    (0x6063, 0, 32),      # Position Actual Internal   (int32) — cached_pos_raw_
+]
+_TOOL_TPDO1 = [           # liftkit tool node 8
+    (0x6003, 0, 16),      # Status_Word       (uint16)
+    (0x6004, 0,  8),      # Mode_Display      (uint8)
+    (0x0005, 0,  8),      # pad               (uint8)
+    (0x6005, 0, 32),      # Actual_Target_Val (int32)
+]
+
+# TPDO2 — 10 Hz (tx_type=50, every 50 SYNCs)
+# staging_offset::kStatusword(2) + kCurrent(3)
+_MOTOR_TPDO2 = [
+    (0x6041, 0, 16),      # Statusword        (uint16) — cached_sw_raw_
+    (0x6078, 0, 16),      # Current Actual    (int16)  — cached_current_raw_
+]
+
+AMR_TPDO1     = {nid: _MOTOR_TPDO1 for nid in AMR_NODES}
+AMR_TPDO2     = {nid: _MOTOR_TPDO2 for nid in AMR_NODES}
+LIFTKIT_TPDO1 = {7: _MOTOR_TPDO1, 8: _TOOL_TPDO1}
+LIFTKIT_TPDO2 = {7: _MOTOR_TPDO2}   # tool node 8 has no 10 Hz TPDO2
+
+# TPDO2 COB-ID base (0x280 + node_id) — matches canopen::kTpdo2Base
+TPDO2_BASE = 0x280
+
+# ── Control loop PID & safety parameter tables ───────────────────────────────
+# Each entry: (group_label, OD_index, [(subindex, meaning), ...])
+_PID_GROUPS = [
+    ('Position Controller', 0x60FB, [
+        (0x01, 'Kp'),
+        (0x02, 'Kd / Ki'),
+        (0x03, 'Anti-windup limit'),
+        (0x05, 'Notch filter on'),
+        (0x07, 'Vel feed-forward'),
+    ]),
+    ('Velocity Controller', 0x60F9, [
+        (0x01, 'Kp'),
+        (0x03, 'Ki'),
+        (0x05, 'Filter param'),
+        (0x08, 'Max output'),
+        (0x0A, 'Max velocity'),
+        (0x0B, 'Limit lo'),
+        (0x0C, 'Limit hi'),
+        (0x0E, 'Accel feed-forward'),
+        (0x10, 'Filter coeff 0'),
+        (0x11, 'Filter coeff 1'),
+        (0x12, 'Filter coeff 2'),
+    ]),
+    ('Current Controller', 0x60F6, [
+        (0x01, 'Kp'),
+        (0x02, 'Ki'),
+        (0x03, 'Gain param'),
+        (0x04, 'Voltage feed-forward'),
+        (0x05, 'Decoupling gain'),
+    ]),
+]
+
+# Safety / protection params: (OD_index, subindex, meaning)
+_SAFETY_PARAMS = [
+    (0x2340, 0x04, 'Current limit'),
+    (0x2340, 0x06, 'Thermal time const'),
+    (0x2340, 0x07, 'Overload threshold'),
+    (0x2340, 0x09, 'Protection param'),
+    (0x2502, 0x01, 'Watchdog param 1'),
+    (0x2502, 0x04, 'Watchdog param 4'),
+    (0x2508, 0x08, 'Watchdog timeout'),
+    (0x2508, 0x09, 'Max retries'),
+]
+
+# ── Tool node SDO state objects (tool_enums.hpp eStatus / eToolId) ────────────
+
+_TOOL_ID_NAMES = {0x00: 'None', 0x01: 'Sander', 0x02: 'Sprayer'}
+_TOOL_STATUS   = {
+    0x00: 'Idle',          0x01: 'Initializing',   0x02: 'Ready',
+    0x03: 'Running',       0x10: 'PressureChange',
+    0x11: 'PowerOn',       0x12: 'PowerOff',
+    0xF0: 'Warning',       0xFF: 'Fault',
+}
+
+# Latch_CTRL (0x2000 WO): bit 0 = TS pair, bit 1 = AMR pair — one bit per pair, no L/R split
+# Latch_FB   (0x2001 RO): bit0=AMR-L, bit1=AMR-R, bit2=TS-L, bit3=TS-R (per ToolMaster docs)
+_LATCH_TS  = 0x01   # CTRL: triggers TS latch pair (L + R simultaneously)
+_LATCH_AMR = 0x02   # CTRL: triggers AMR latch pair (L + R simultaneously)
+
+# Control_Word codes (RPDO2 COB 0x308: [CW:U16LE][Mode:U8])
+_CW_INIT         = 0x0000   # kInit — both sander and sprayer (mode=kNormal)
+_CW_SPRAYER_ON   = 0x0001   # eSprayerCmd::kEoaSprayerOn
+_CW_SPRAYER_OFF  = 0x0002   # eSprayerCmd::kEoaSprayerOff
+_CW_SANDER_ON    = 0x0001   # eSanderCmd::kPowerOn
+_CW_SANDER_OFF   = 0x0002   # eSanderCmd::kPowerOff
+_CW_SANDER_SPEED = 0x0003   # eSanderCmd::kSetSpeed (uses Target_Value from RPDO1)
+_CW_EMCY_STOP    = 0x0000   # send with mode=0x02 (eMode::kEmcyStop)
+_MODE_NORMAL     = 0x01     # eMode::kNormal
+_MODE_EMCY       = 0x02     # eMode::kEmcyStop
+
+# TPDO4 layout (COB 0x488, event 100ms): [HmiButton:U8][DcCurrent:I8][AcCurrent:I8][Temp:I8]
+# Order from ToolMaster_V1.dcf PDO mapping: 0x2002, 0x2003, 0x2004, 0x2005
+
+# ── Result tracking ───────────────────────────────────────────────────────────
+
+_any_failure = False
+
+def result(ok, msg):
+    global _any_failure
+    if not ok:
+        _any_failure = True
+    mark = PASS if ok else FAIL
+    print(f"  {mark} {msg}")
+    return ok
+
+# ── CAN helpers ───────────────────────────────────────────────────────────────
+
+def can_interface_up(iface):
+    try:
+        r = subprocess.run(['ip', 'link', 'show', iface],
+                           capture_output=True, text=True, timeout=2)
+        return 'state UP' in r.stdout
+    except Exception:
+        return False
+
+def _open_can_socket(iface):
+    sock = socket.socket(socket.AF_CAN, socket.SOCK_RAW, socket.CAN_RAW)
+    sock.bind((iface,))
+    sock.settimeout(0.05)
+    return sock
+
+def send_nmt(sock, command, node_id=0):
+    """Send NMT command. node_id=0 broadcasts to all nodes on the bus."""
+    payload = struct.pack('BB6x', command, node_id)
+    sock.send(struct.pack('=IB3x8s', 0x000, 2, payload))
+
+def sdo_read_u16(sock, node_id, index, subindex, timeout=0.5):
+    """CANopen expedited SDO upload. Returns uint16 or None on error/timeout."""
+    cob_req = 0x600 + node_id
+    data = struct.pack('<BHBB4x', 0x40, index, subindex, 0)
+    try:
+        sock.send(struct.pack('=IB3x8s', cob_req, 8, data))
+    except Exception:
+        return None
+    cob_resp = 0x580 + node_id
+    deadline = time.monotonic() + timeout
+    while time.monotonic() < deadline:
+        try:
+            raw = sock.recv(FRAME_SZ)
+            rid, _dlc, rdata = struct.unpack('=IB3x8s', raw)
+            if (rid & 0x1FFFFFFF) != cob_resp:
+                continue
+            if rdata[0] == 0x80:   # SDO abort
+                return None
+            return struct.unpack_from('<H', rdata, 4)[0]
+        except socket.timeout:
+            pass
+    return None
+
+def _sdo_write(sock, node_id, cmd, index, subindex, data_bytes, timeout=0.5):
+    """Base SDO expedited download. cmd encodes the data size (0x2F/0x2B/0x23)."""
+    cob_req  = 0x600 + node_id
+    cob_resp = 0x580 + node_id
+    payload  = struct.pack('=IB3x8s', cob_req, 8,
+                           struct.pack('<BHB', cmd, index, subindex) + data_bytes)
+    try:
+        sock.send(payload)
+    except Exception:
+        return False
+    deadline = time.monotonic() + timeout
+    while time.monotonic() < deadline:
+        try:
+            raw = sock.recv(FRAME_SZ)
+            rid, _dlc, rdata = struct.unpack('=IB3x8s', raw)
+            if (rid & 0x1FFFFFFF) != cob_resp:
+                continue
+            if rdata[0] == 0x80:   # SDO abort
+                return False
+            if rdata[0] == 0x60:   # download acknowledge
+                return True
+        except socket.timeout:
+            pass
+    return False
+
+
+def sdo_write_i8(sock, node_id, index, subindex, value, timeout=0.5):
+    """SDO download, INT8 — cmd 0x2F (1 data byte)."""
+    return _sdo_write(sock, node_id, 0x2F, index, subindex,
+                      struct.pack('<b3x', value), timeout)
+
+
+def sdo_write_u16(sock, node_id, index, subindex, value, timeout=0.5):
+    """SDO download, UINT16 — cmd 0x2B (2 data bytes). Use for controlword 0x6040."""
+    return _sdo_write(sock, node_id, 0x2B, index, subindex,
+                      struct.pack('<H2x', value & 0xFFFF), timeout)
+
+
+def sdo_write_u8(sock, node_id, index, subindex, value, timeout=0.5):
+    """SDO download, UINT8 — cmd 0x2F (1 data byte). Use for TPDO mapping count, tx type."""
+    return _sdo_write(sock, node_id, 0x2F, index, subindex,
+                      struct.pack('<B3x', value & 0xFF), timeout)
+
+
+def sdo_write_u32(sock, node_id, index, subindex, value, timeout=0.5):
+    """SDO download, UINT32 — cmd 0x23 (4 data bytes). Use for TPDO COB-ID / mapping entries."""
+    return _sdo_write(sock, node_id, 0x23, index, subindex,
+                      struct.pack('<I', value & 0xFFFFFFFF), timeout)
+
+
+def sdo_write_i32(sock, node_id, index, subindex, value, timeout=0.5):
+    """SDO download, INT32 — cmd 0x23 (4 data bytes). Use for target position 0x607A."""
+    return _sdo_write(sock, node_id, 0x23, index, subindex,
+                      struct.pack('<i', value), timeout)
+
+
+def sdo_read_i32(sock, node_id, index, subindex, timeout=0.5):
+    """CANopen expedited SDO upload for int32. Returns int32 or None on error/timeout."""
+    cob_req = 0x600 + node_id
+    data = struct.pack('<BHBB4x', 0x40, index, subindex, 0)
+    try:
+        sock.send(struct.pack('=IB3x8s', cob_req, 8, data))
+    except Exception:
+        return None
+    cob_resp = 0x580 + node_id
+    deadline = time.monotonic() + timeout
+    while time.monotonic() < deadline:
+        try:
+            raw = sock.recv(FRAME_SZ)
+            rid, _dlc, rdata = struct.unpack('=IB3x8s', raw)
+            if (rid & 0x1FFFFFFF) != cob_resp:
+                continue
+            if rdata[0] == 0x80:
+                return None
+            return struct.unpack_from('<i', rdata, 4)[0]
+        except socket.timeout:
+            pass
+    return None
+
+def sdo_read_raw(sock, node_id, index, subindex, timeout=0.5):
+    """Generic SDO upload — returns integer value for any object size, or None."""
+    cob_req  = 0x600 + node_id
+    cob_resp = 0x580 + node_id
+    req = struct.pack('<BHBB4x', 0x40, index, subindex, 0)
+    try:
+        sock.send(struct.pack('=IB3x8s', cob_req, 8, req))
+    except Exception:
+        return None
+    deadline = time.monotonic() + timeout
+    while time.monotonic() < deadline:
+        try:
+            raw = sock.recv(FRAME_SZ)
+            rid, _dlc, rdata = struct.unpack('=IB3x8s', raw)
+            if (rid & 0x1FFFFFFF) != cob_resp:
+                continue
+            if rdata[0] == 0x80:
+                return None
+            # CiA 301 expedited upload response: cmd byte encodes number of bytes
+            cmd = rdata[0]
+            n_bytes = 4 - ((cmd >> 2) & 0x03) if (cmd & 0x02) else 4
+            return int.from_bytes(rdata[4:4 + n_bytes], 'little')
+        except socket.timeout:
+            pass
+    return None
+
+
+def check_statusword_sock(sock, node_id, label):
+    """Read statusword via open socket, check fault bit."""
+    sw = sdo_read_u16(sock, node_id, index=0x6041, subindex=0)
+    if sw is None:
+        result(False, f"{label:<11} node {node_id}  statusword — no SDO response")
+        return False
+    fault = bool(sw & 0x0008)
+    ok = not fault
+    result(ok, f"{label:<11} node {node_id}  statusword 0x{sw:04X} — {'no fault' if ok else _red('FAULT')}")
+    return ok
+
+# ── UR RTDE timing ────────────────────────────────────────────────────────────
+
+_RTDE_PORT             = 30004
+_RTDE_PROTO_VER        = 2
+_RTDE_REQUEST_PROTOCOL = 86   # 0x56
+_RTDE_GET_VERSION      = 119  # 0x77
+_RTDE_SETUP_OUTPUTS    = 79   # 0x4F
+_RTDE_SETUP_INPUTS     = 73   # 0x49
+_RTDE_START            = 83   # 0x53
+_RTDE_PAUSE            = 80   # 0x50
+_RTDE_DATA_PACKAGE     = 85   # 0x55
+_UR_TARGET_HZ          = 500.0
+_UR_TIMING_S           = 5.0
+_UR_SYNC_SAMPLES       = 50
+_UR_DESIGNED_LAT_US    = 1000.0   # <1 ms
+_UR_DESIGNED_SYNC_US   = 2500.0   # < 1 RTDE cycle at 500 Hz (2 ms) + 25% margin
+
+# RTDE type name → byte size in DATA_PACKAGE (SETUP_OUTPUTS response is ASCII, not numeric)
+_RTDE_TYPE_SIZES = {
+    'BOOL': 1,  'UINT8': 1,
+    'UINT16': 2, 'INT16': 2,
+    'UINT32': 4, 'INT32': 4, 'FLOAT': 4,
+    'UINT64': 8, 'INT64': 8, 'DOUBLE': 8,
+    'VECTOR3D': 24, 'VECTOR6INT32': 24,
+    'VECTOR6D': 48,
+    'NOT_FOUND': 0,
+}
+
+_UR_ROBOT_MODES = {
+    -1: 'NO_CONTROLLER', 0: 'DISCONNECTED', 1: 'CONFIRM_SAFETY',
+     2: 'BOOTING',       3: 'POWER_OFF',    4: 'POWER_ON',
+     5: 'IDLE',          6: 'BACKDRIVE',    7: 'RUNNING',
+     8: 'UPDATING_FIRMWARE',
+}
+_UR_SAFETY_MODES = {
+    1: 'NORMAL',           2: 'REDUCED',              3: 'PROTECTIVE_STOP',
+    4: 'RECOVERY',         5: 'SAFEGUARD_STOP',        6: 'SYSTEM_EMERGENCY_STOP',
+    7: 'ROBOT_EMERGENCY_STOP', 8: 'VIOLATION',         9: 'FAULT',
+}
+_UR_PAYLOAD_VARS = (
+    'timestamp,actual_q,actual_TCP_pose,'
+    'robot_mode,safety_mode,speed_scaling,'
+    'actual_robot_voltage,actual_robot_current'
+)
+
+
+def _rtde_send(sock, msg_type, payload=b''):
+    sock.sendall(struct.pack('>HB', 3 + len(payload), msg_type) + payload)
+
+
+def _rtde_recv(sock, expect_type=None, timeout=1.0):
+    """Read one RTDE frame, optionally skipping until expect_type is seen."""
+    deadline = time.monotonic() + timeout
+    while time.monotonic() < deadline:
+        sock.settimeout(max(0.01, deadline - time.monotonic()))
+        try:
+            hdr = b''
+            while len(hdr) < 3:
+                chunk = sock.recv(3 - len(hdr))
+                if not chunk:
+                    return None, None
+                hdr += chunk
+            size, mtype = struct.unpack('>HB', hdr)
+            body = b''
+            remaining = size - 3
+            while remaining > 0:
+                chunk = sock.recv(remaining)
+                if not chunk:
+                    return None, None
+                body += chunk
+                remaining -= len(chunk)
+            if expect_type is None or mtype == expect_type:
+                return mtype, body
+            # unknown / unwanted frame — keep reading
+        except socket.timeout:
+            break
+    return None, None
+
+
+def check_ur_rtde_timing(ur_ip):
+    """
+    Single RTDE session that measures timing (latency, frequency, sync) and
+    captures one DATA_PACKAGE snapshot of robot state variables.
+    """
+    print(f"\n  [UR RTDE — {ur_ip}:{_RTDE_PORT} — {_UR_TIMING_S:.0f} s @ {_UR_TARGET_HZ:.0f} Hz]")
+
+    try:
+        s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        s.settimeout(3.0)
+        s.connect((ur_ip, _RTDE_PORT))
+    except Exception as exc:
+        print(f"  [warn] RTDE connect failed: {exc}")
+        return
+
+    rtt_samples, intervals, sync_samples = [], [], []
+    payload_var_names  = _UR_PAYLOAD_VARS.split(',')
+    payload_type_codes = []
+    snapshot_raw       = None
+
+    try:
+        # ── Protocol negotiation ──────────────────────────────────────────────
+        _rtde_send(s, _RTDE_REQUEST_PROTOCOL, struct.pack('>H', _RTDE_PROTO_VER))
+        mtype, resp = _rtde_recv(s, expect_type=_RTDE_REQUEST_PROTOCOL)
+        if not resp or resp[0] != 1:
+            print(f"  [warn] RTDE protocol negotiation failed")
+            return
+
+        # ── Latency: RTT using REQUEST_PROTOCOL ping (stateless, no recipe change) ──
+        freq_bytes = struct.pack('>d', _UR_TARGET_HZ)
+        proto_ping = struct.pack('>H', _RTDE_PROTO_VER)
+        for _ in range(20):
+            t0 = time.monotonic_ns()
+            _rtde_send(s, _RTDE_REQUEST_PROTOCOL, proto_ping)
+            mtype, resp = _rtde_recv(s, expect_type=_RTDE_REQUEST_PROTOCOL, timeout=0.5)
+            if mtype == _RTDE_REQUEST_PROTOCOL:
+                rtt_samples.append((time.monotonic_ns() - t0) / 1_000)
+
+        # ── SETUP_OUTPUTS with full payload variable list ─────────────────────
+        _rtde_send(s, _RTDE_SETUP_OUTPUTS, freq_bytes + _UR_PAYLOAD_VARS.encode())
+        mtype, resp = _rtde_recv(s, expect_type=_RTDE_SETUP_OUTPUTS, timeout=1.0)
+        if mtype != _RTDE_SETUP_OUTPUTS or not resp:
+            print(f"  [warn] RTDE output setup failed")
+            return
+        # Response body: [recipe_id: 1B][comma-separated ASCII type names]
+        # e.g. b'\x01DOUBLE,VECTOR6D,VECTOR6D,INT32,INT32,DOUBLE,DOUBLE,DOUBLE'
+        if len(resp) > 1:
+            payload_type_codes = resp[1:].decode('ascii', errors='replace').split(',')
+        if len(payload_type_codes) != len(payload_var_names):
+            payload_type_codes = []
+        # Retry without NOT_FOUND variables
+        if 'NOT_FOUND' in payload_type_codes:
+            good_pairs = [(nm, tn) for nm, tn in zip(payload_var_names, payload_type_codes)
+                          if tn != 'NOT_FOUND']
+            if good_pairs:
+                good_names = [p[0] for p in good_pairs]
+                _rtde_send(s, _RTDE_SETUP_OUTPUTS, freq_bytes + ','.join(good_names).encode())
+                mtype, resp = _rtde_recv(s, expect_type=_RTDE_SETUP_OUTPUTS, timeout=1.0)
+                if mtype == _RTDE_SETUP_OUTPUTS and len(resp) > 1:
+                    payload_type_codes = resp[1:].decode('ascii', errors='replace').split(',')
+                    payload_var_names  = good_names
+
+        # ── Input setup for sync measurement ─────────────────────────────────
+        _rtde_send(s, _RTDE_SETUP_INPUTS, b'speed_slider_fraction')
+        mtype, resp = _rtde_recv(s, expect_type=_RTDE_SETUP_INPUTS, timeout=1.0)
+        input_rid = resp[0] if (mtype == _RTDE_SETUP_INPUTS and resp) else None
+
+        # ── Start streaming ───────────────────────────────────────────────────
+        _rtde_send(s, _RTDE_START)
+        mtype, resp = _rtde_recv(s, expect_type=_RTDE_START, timeout=1.0)
+        if not resp or resp[0] != 1:
+            print(f"  [warn] RTDE start failed")
+            return
+
+        # ── Sync: cmd→feedback round-trip ────────────────────────────────────
+        if input_rid is not None:
+            for _ in range(_UR_SYNC_SAMPLES):
+                mtype, _ = _rtde_recv(s, expect_type=_RTDE_DATA_PACKAGE, timeout=0.05)
+                if mtype != _RTDE_DATA_PACKAGE:
+                    continue
+                t_cmd = time.monotonic_ns()
+                _rtde_send(s, _RTDE_DATA_PACKAGE,
+                           struct.pack('>Bd', input_rid, 1.0))
+                mtype, _ = _rtde_recv(s, expect_type=_RTDE_DATA_PACKAGE, timeout=0.05)
+                if mtype == _RTDE_DATA_PACKAGE:
+                    sync_samples.append((time.monotonic_ns() - t_cmd) / 1_000)
+
+        # ── Frequency + snapshot ─────────────────────────────────────────────
+        last_t   = time.monotonic_ns()
+        deadline = time.monotonic() + _UR_TIMING_S
+        while time.monotonic() < deadline:
+            mtype, body = _rtde_recv(s, expect_type=_RTDE_DATA_PACKAGE, timeout=0.01)
+            if mtype == _RTDE_DATA_PACKAGE:
+                now = time.monotonic_ns()
+                intervals.append((now - last_t) / 1_000)
+                last_t = now
+                if snapshot_raw is None:
+                    snapshot_raw = body   # save first packet for payload display
+
+        _rtde_send(s, _RTDE_PAUSE)
+        _rtde_recv(s, expect_type=_RTDE_PAUSE, timeout=0.5)
+
+    finally:
+        s.close()
+
+    # ── Timing results ────────────────────────────────────────────────────────
+    avg = lambda lst: sum(lst) / len(lst) if lst else 0.0
+
+    avg_interval_us = avg(intervals)
+    freq_hz         = 1e6 / avg_interval_us if avg_interval_us else 0.0
+    lat_avg         = avg(rtt_samples)
+    lat_min         = min(rtt_samples) if rtt_samples else 0.0
+    lat_max         = max(rtt_samples) if rtt_samples else 0.0
+    sync_avg        = avg(sync_samples)
+    sync_min        = min(sync_samples) if sync_samples else 0.0
+
+    col_d = 12
+    col_a = 44
+    print(f"\n  {'metric':<18}  {'designed':>{col_d}}  actual")
+    print(f"  {'-'*18}  {'-'*col_d}  {'-'*col_a}")
+    print(f"  {'frequency_hz':<18}  {f'{_UR_TARGET_HZ:.0f} Hz':>{col_d}}  {freq_hz:.2f} Hz")
+    print(f"  {'latency_us':<18}  {f'<{_UR_DESIGNED_LAT_US/1000:.0f} ms':>{col_d}}  "
+          f"{lat_avg:.1f} µs avg  (min {lat_min:.1f}  max {lat_max:.1f})")
+    cycle_ms  = 1000.0 / _UR_TARGET_HZ
+    sync_str  = f'{sync_avg:.1f} µs' if sync_samples else 'N/A (input setup failed)'
+    print(f"  {'sync_us':<18}  {f'<1 cycle ({cycle_ms:.0f} ms)':>{col_d}}  {sync_str}")
+
+    # ── Payload snapshot ──────────────────────────────────────────────────────
+    print(f"\n  [UR RTDE payload snapshot]")
+    col = 24
+    print(f"  {'variable':<{col}}  value")
+    print(f"  {'-'*col}  {'-'*55}")
+
+    decoded = {}
+    if snapshot_raw and payload_type_codes:
+        offset = 1   # skip recipe_id byte
+        for name, tn in zip(payload_var_names, payload_type_codes):
+            size = _RTDE_TYPE_SIZES.get(tn, 0)
+            if size == 0:
+                decoded[name] = None
+                continue
+            chunk = snapshot_raw[offset:offset + size]
+            if len(chunk) < size:
+                decoded[name] = None
+            elif tn == 'DOUBLE':
+                decoded[name] = struct.unpack('>d', chunk)[0]
+            elif tn == 'FLOAT':
+                decoded[name] = struct.unpack('>f', chunk)[0]
+            elif tn == 'INT32':
+                decoded[name] = struct.unpack('>i', chunk)[0]
+            elif tn == 'UINT32':
+                decoded[name] = struct.unpack('>I', chunk)[0]
+            elif tn == 'INT16':
+                decoded[name] = struct.unpack('>h', chunk)[0]
+            elif tn == 'UINT16':
+                decoded[name] = struct.unpack('>H', chunk)[0]
+            elif tn in ('BOOL', 'UINT8'):
+                decoded[name] = chunk[0]
+            elif tn == 'VECTOR6D':
+                decoded[name] = struct.unpack('>6d', chunk)
+            elif tn == 'VECTOR3D':
+                decoded[name] = struct.unpack('>3d', chunk)
+            elif tn == 'VECTOR6INT32':
+                decoded[name] = struct.unpack('>6i', chunk)
+            else:
+                decoded[name] = chunk.hex()
+            offset += size
+
+    for name in _UR_PAYLOAD_VARS.split(','):
+        v = decoded.get(name)
+        if v is None:
+            print(f"  {name:<{col}}  N/A")
+        elif name == 'timestamp':
+            print(f"  {name:<{col}}  {v:.3f} s")
+        elif name == 'actual_q':
+            deg = [math.degrees(x) for x in v]
+            print(f"  {name:<{col}}  [{', '.join(f'{x:.2f}' for x in deg)}] deg")
+        elif name == 'actual_TCP_pose':
+            pos = [v[i] * 1000 for i in range(3)]
+            rot = [math.degrees(v[i]) for i in range(3, 6)]
+            print(f"  {name:<{col}}  xyz [{', '.join(f'{x:.1f}' for x in pos)}] mm"
+                  f"  rot [{', '.join(f'{x:.2f}' for x in rot)}] deg")
+        elif name == 'robot_mode':
+            print(f"  {name:<{col}}  {v} ({_UR_ROBOT_MODES.get(v, '?')})")
+        elif name == 'safety_mode':
+            print(f"  {name:<{col}}  {v} ({_UR_SAFETY_MODES.get(v, '?')})")
+        elif name == 'speed_scaling':
+            print(f"  {name:<{col}}  {v:.3f}")
+        elif name == 'actual_robot_voltage':
+            print(f"  {name:<{col}}  {v:.1f} V")
+        elif name == 'actual_robot_current':
+            print(f"  {name:<{col}}  {v:.2f} A")
+        else:
+            print(f"  {name:<{col}}  {v}")
+
+
+# ── UR Arm ────────────────────────────────────────────────────────────────────
+
+UR_FAIL_MODES = {
+    'PROTECTIVE_STOP', 'ROBOT_EMERGENCY_STOP',
+    'SYSTEM_EMERGENCY_STOP', 'FAULT', 'VIOLATION', 'POWER_OFF',
+}
+
+def check_ur(ur_ip):
+    print(f"\n[UR ARM — {ur_ip}]")
+
+    robot_mode = safety_mode = remote_ctrl = None
+
+    def _dashboard_query(cmd_bytes):
+        """Fresh dashboard connection per query — avoids mixed responses in the recv buffer."""
+        try:
+            ds = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+            ds.settimeout(3)
+            ds.connect((ur_ip, 29999))
+            ds.recv(512)   # discard banner
+            ds.sendall(cmd_bytes)
+            time.sleep(0.05)
+            raw = ds.recv(256).decode(errors='replace').strip()
+            ds.close()
+            return raw
+        except Exception:
+            return None
+
+    try:
+        probe = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        probe.settimeout(3)
+        probe.connect((ur_ip, 29999))
+        probe.recv(256)
+        probe.close()
+        result(True, "Dashboard server reachable (port 29999)")
+
+        robot_mode  = _dashboard_query(b'robotmode\n')
+        safety_mode = _dashboard_query(b'safetymode\n')
+        remote_ctrl = _dashboard_query(b'isInRemoteControl\n')
+    except Exception as exc:
+        result(False, f"Dashboard server unreachable (port 29999): {exc}")
+        result(False, "Robot mode — skipped (no dashboard connection)")
+        result(False, "Safety mode — skipped (no dashboard connection)")
+        result(False, "Control mode — skipped (no dashboard connection)")
+
+    if robot_mode is not None:
+        mode_val = robot_mode.split(':', 1)[-1].strip() if ':' in robot_mode else robot_mode
+        ok = any(s in mode_val for s in ('RUNNING', 'IDLE'))
+        result(ok, f"Robot mode: {mode_val}")
+
+    if safety_mode is not None:
+        mode_val = safety_mode.split(':', 1)[-1].strip() if ':' in safety_mode else safety_mode
+        ok = not any(bad in mode_val for bad in UR_FAIL_MODES)
+        result(ok, f"Safety mode: {mode_val}")
+
+    if remote_ctrl is not None:
+        rc_lower = remote_ctrl.lower()
+        if 'could not understand' in rc_lower or 'not supported' in rc_lower:
+            pass   # command not supported on this firmware — skip silently
+        elif 'true' in rc_lower:
+            result(True, "Control mode: REMOTE")
+        elif 'false' in rc_lower:
+            result(False, "Control mode: " + _red('LOCAL — switch to REMOTE for autonomous operation'))
+        # any other unexpected response → skip silently
+
+    rtde_reachable = False
+    for port, label in ((30001, 'Primary interface port 30001'), (30004, 'RTDE port 30004')):
+        try:
+            s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+            s.settimeout(2)
+            s.connect((ur_ip, port))
+            s.close()
+            result(True, f"{label} open")
+            if port == 30004:
+                rtde_reachable = True
+        except Exception as exc:
+            result(False, f"{label} unreachable: {exc}")
+
+    if rtde_reachable:
+        check_ur_rtde_timing(ur_ip)
+
+
+# ── SDO round-trip latency measurement ───────────────────────────────────────
+
+def _sdo_rtt_samples(sock, nid, n=20, index=0x6041, subindex=0):
+    """
+    Measure SDO round-trip time by sending n read requests for the given object
+    and timing each request→response pair. Node must be in NMT Pre-Operational.
+    Returns list of RTT values in microseconds (empty if node not responding).
+    Use index=0x6041 for CiA 402 motor nodes, index=0x2001 (latch_fb) for tool node.
+    """
+    cob_req   = 0x600 + nid
+    cob_resp  = 0x580 + nid
+    req_frame = struct.pack('=IB3x8s', cob_req, 8,
+                            struct.pack('<BHBB4x', 0x40, index, subindex, 0))
+    samples   = []
+    orig      = sock.gettimeout()
+    sock.settimeout(0.05)
+    try:
+        for _ in range(n):
+            t0 = time.monotonic_ns()
+            sock.send(req_frame)
+            deadline = time.monotonic() + 0.05
+            while time.monotonic() < deadline:
+                try:
+                    raw = sock.recv(FRAME_SZ)
+                    rid, _dlc, _ = struct.unpack(CAN_FRAME_FMT, raw)
+                    if (rid & 0x1FFFFFFF) == cob_resp:
+                        samples.append((time.monotonic_ns() - t0) / 1_000)
+                        break
+                except socket.timeout:
+                    break
+    finally:
+        sock.settimeout(orig)
+    return samples
+
+
+# ── PDO configuration via SDO (CiA 301 §7.8.2) ───────────────────────────────
+
+def _configure_pdo(sock, nid, pdo_num, mapping, tx_type, timeout=0.5):
+    """
+    Remap one TPDO on a slave via the CiA 301 SDO sequence:
+      invalidate COB-ID → clear mapping → write entries → set count →
+      set transmission type → revalidate COB-ID.
+
+    pdo_num=1 → TPDO1 (comm 0x1800, map 0x1A00, COB 0x180+nid)
+    pdo_num=2 → TPDO2 (comm 0x1801, map 0x1A01, COB 0x280+nid)
+    Mirrors remap_pdo() in origin_motor_node_driver.cpp.
+    Must be called while node is in NMT Pre-Operational.
+    """
+    comm = 0x1800 + (pdo_num - 1)
+    mapp = 0x1A00 + (pdo_num - 1)
+    cob  = 0x180 + (pdo_num - 1) * 0x100 + nid
+
+    ok  = sdo_write_u32(sock, nid, comm, 1, 0x80000000 | cob, timeout)  # disable
+    ok &= sdo_write_u8 (sock, nid, mapp, 0, 0, timeout)                  # clear count
+    for i, (idx, sub, bits) in enumerate(mapping, 1):
+        ok &= sdo_write_u32(sock, nid, mapp, i, (idx << 16) | (sub << 8) | bits, timeout)
+    ok &= sdo_write_u8 (sock, nid, mapp, 0, len(mapping), timeout)       # set count
+    ok &= sdo_write_u8 (sock, nid, comm, 2, tx_type, timeout)            # tx type
+    ok &= sdo_write_u32(sock, nid, comm, 1, cob, timeout)                # re-enable
+    return bool(ok)
+
+
+# ── CAN timing test ───────────────────────────────────────────────────────────
+
+def run_can_timing_test(sock, bus_name, node_ids, tpdo1_map=None, tpdo2_map=None):
+    """
+    Run a 5-second 500 Hz RPDO→SYNC→TPDO loop on an already-open socket.
+    tpdo1_map / tpdo2_map: {node_id: [(index, subindex, bits), ...]}
+    Programs TPDO1 (tx=0x01, 500 Hz) and TPDO2 (tx=50, 10 Hz) via SDO before
+    the loop so drives send the correct payloads.
+    Nodes stay in their disabled FSA state — zero motion.
+    """
+    rpdo_frames = [_rpdo_frame(nid) for nid in node_ids]
+
+    print(f"\n  [CAN timing — {bus_name} — {TEST_DURATION_S:.0f} s @ 500 Hz]")
+
+    # ── Configure TPDO1 + TPDO2 per bus.yml before going Operational ─────────
+    if tpdo1_map:
+        for nid in node_ids:
+            if nid in tpdo1_map:
+                ok = _configure_pdo(sock, nid, 1, tpdo1_map[nid], 0x01)
+                if not ok:
+                    print(f"  [warn] node {nid}: TPDO1 config SDO failed — coverage may be 0")
+    if tpdo2_map:
+        for nid in node_ids:
+            if nid in tpdo2_map:
+                ok = _configure_pdo(sock, nid, 2, tpdo2_map[nid], 50)
+                if not ok:
+                    print(f"  [warn] node {nid}: TPDO2 config SDO failed")
+
+    # ── SDO round-trip latency (Pre-Op, before NMT_START) ────────────────────
+    motor_nodes = [nid for nid in node_ids if (tpdo2_map and nid in tpdo2_map)]
+    sdo_rtt = {}   # nid → (min_us, avg_us, max_us)
+    for nid in motor_nodes:
+        samples = _sdo_rtt_samples(sock, nid)
+        if samples:
+            sdo_rtt[nid] = (min(samples), sum(samples) / len(samples), max(samples))
+
+    # Nodes → Operational so TPDO1 fires on SYNC. Drives have no enabled
+    # controlword, so they remain in Switch On Disabled — zero motion.
+    send_nmt(sock, NMT_START, 0)
+    time.sleep(0.2)
+
+    # Build expected DLC per node from the mapping (sum of bits / 8)
+    expected_dlc  = {}
+    expected_dlc2 = {}
+    if tpdo1_map:
+        for nid, mapping in tpdo1_map.items():
+            expected_dlc[nid] = sum(bits for _, _, bits in mapping) // 8
+    if tpdo2_map:
+        for nid, mapping in tpdo2_map.items():
+            expected_dlc2[nid] = sum(bits for _, _, bits in mapping) // 8
+
+    orig_timeout = sock.gettimeout()
+    sock.settimeout(0.0001)   # 100 µs — keeps spin-reads non-blocking
+
+    intervals, loop_times = [], []
+    full_cycles   = 0   # cycles where every expected node sent TPDO1 back
+    last_payload  = {}  # node_id → (dlc, raw bytes) last TPDO1 frame
+    last_tpdo2    = {}  # node_id → (dlc, raw bytes) last TPDO2 frame
+    prev_t        = None
+    target_ns     = time.monotonic_ns()
+    deadline_ns   = target_ns + int(TEST_DURATION_S * 1e9)
+
+    try:
+        while time.monotonic_ns() < deadline_ns:
+            t0 = time.monotonic_ns()
+
+            # 1. Send RPDO1 to every node — zero payload, ignored by disabled drives
+            for frame in rpdo_frames:
+                sock.send(frame)
+
+            # 2. SYNC — tells drives to latch the staged RPDO and fire TPDO1
+            sock.send(_SYNC_FRAME)
+            t_sync = time.monotonic_ns()
+
+            # 3. Spin-read incoming frames for TPDO_COLLECT_US, collect TPDO1+TPDO2
+            tpdo_rx      = {}
+            collect_end  = t_sync + TPDO_COLLECT_US * 1_000
+            while time.monotonic_ns() < collect_end:
+                try:
+                    rid, dlc, raw_payload = struct.unpack(CAN_FRAME_FMT, sock.recv(FRAME_SZ))
+                    cid = rid & 0x1FFFFFFF
+                    if TPDO1_BASE < cid <= TPDO1_BASE + 0x7F:
+                        nid = cid - TPDO1_BASE
+                        if nid not in tpdo_rx:
+                            tpdo_rx[nid] = time.monotonic_ns()
+                            last_payload[nid] = (dlc, raw_payload[:dlc])
+                    elif TPDO2_BASE < cid <= TPDO2_BASE + 0x7F:
+                        nid2 = cid - TPDO2_BASE
+                        last_tpdo2[nid2] = (dlc, raw_payload[:dlc])
+                except (socket.timeout, BlockingIOError):
+                    pass
+
+            t1 = time.monotonic_ns()
+
+            if prev_t is not None:
+                intervals.append((t0 - prev_t) / 1_000)
+            if len(tpdo_rx) == len(node_ids):
+                full_cycles += 1
+            loop_times.append((t1 - t0) / 1_000)
+            prev_t = t0
+
+            target_ns += SYNC_INTERVAL_US * 1_000
+            _precise_sleep_until(target_ns)
+
+    finally:
+        sock.settimeout(orig_timeout)
+        send_nmt(sock, NMT_STOP, 0)
+        time.sleep(0.05)
+
+    # ── Post-loop SDO payload check ───────────────────────────────────────────
+    send_nmt(sock, NMT_PRE_OP, 0)
+    time.sleep(0.1)
+    sdo_ok_count = 0
+    sdo_fail_notes = []
+    for nid in motor_nodes:   # only CiA 402 nodes have 0x6041
+        sw = sdo_read_u16(sock, nid, 0x6041, 0)
+        if sw is None:
+            sdo_fail_notes.append(f"node {nid}: no response")
+        elif sw & 0x0008:
+            sdo_fail_notes.append(f"node {nid}: FAULT sw=0x{sw:04X}")
+        else:
+            sdo_ok_count += 1
+    sdo_summary = f"{sdo_ok_count}/{len(motor_nodes)} OK"
+    if sdo_fail_notes:
+        sdo_summary += '  (' + ', '.join(sdo_fail_notes) + ')'
+
+    avg = lambda lst: sum(lst) / len(lst) if lst else 0.0
+    avg_interval     = avg(intervals)
+    jitter           = max(abs(x - SYNC_INTERVAL_US) for x in intervals) if intervals else 0.0
+    worst_intv       = max(intervals) if intervals else 0.0
+    total_cycles     = len(loop_times)
+    cycles           = len(intervals) + 1
+    tpdo_coverage    = full_cycles / total_cycles * 100.0 if total_cycles else 0.0
+
+    rows = [
+        ('cycles',              f'{cycles}'),
+        ('sync_freq_hz',        f'{1e6 / avg_interval:.2f}' if avg_interval else 'N/A'),
+        ('jitter_us',           f'{jitter:.1f}'),
+        ('loop_time_us',        f'{avg(loop_times):.1f}'),
+        ('worst_interval_us',   f'{worst_intv:.1f}'),
+        ('tpdo_coverage_pct',   f'{tpdo_coverage:.1f}'),
+        ('sdo_payload',         sdo_summary),
+    ]
+    col = max(len(k) for k, _ in rows)
+    for key, val in rows:
+        print(f"    {key:<{col}}  {val:>10}")
+
+    # ── SDO latency — avg across responding motor nodes ──────────────────────
+    if sdo_rtt:
+        avgs    = [av for _, av, _ in sdo_rtt.values()]
+        overall = sum(avgs) / len(avgs)
+        print(f"    {'sdo_latency_us':<{col}}  {overall:>10.1f}")
+
+    # ── Per-node payload decode (last received frames) ────────────────────────
+    def _decode_frame(raw, mapping):
+        """Decode raw PDO bytes according to mapping, return list of 'OBJ=val' strings."""
+        parts, offset = [], 0
+        for idx, sub, bits in mapping:
+            nb = bits // 8
+            chunk = raw[offset:offset + nb]
+            if nb == 4:
+                val = struct.unpack_from('<i', chunk)[0]
+            elif nb == 2:
+                if idx == 0x6078:
+                    val = struct.unpack_from('<h', chunk)[0]
+                else:
+                    val = struct.unpack_from('<H', chunk)[0]
+            elif nb == 1:
+                val = chunk[0]
+            else:
+                val = chunk.hex()
+            parts.append(f"0x{idx:04X}={val}")
+            offset += nb
+        return parts
+
+    if last_payload and tpdo1_map:
+        print(f"\n  {'node':<6}  {'label':<12}  {'TPDO1 payload (last frame)'}")
+        for nid in sorted(last_payload):
+            dlc, raw = last_payload[nid]
+            mapping  = tpdo1_map.get(nid, [])
+            label    = AMR_NODES.get(nid, f'node{nid}')
+            parts    = _decode_frame(raw, mapping)
+            print(f"  {nid:<6}  {label:<12}  {' | '.join(parts)}")
+
+    if last_tpdo2 and tpdo2_map:
+        print(f"\n  {'node':<6}  {'label':<12}  {'TPDO2 payload (last frame)'}")
+        for nid in sorted(last_tpdo2):
+            dlc, raw = last_tpdo2[nid]
+            mapping  = tpdo2_map.get(nid, [])
+            label    = AMR_NODES.get(nid, f'node{nid}')
+            parts    = _decode_frame(raw, mapping)
+            print(f"  {nid:<6}  {label:<12}  {' | '.join(parts)}")
+
+# ── Control loop PID & safety readout ────────────────────────────────────────
+
+def check_motor_pids(sock, node_ids, node_labels=None):
+    """
+    Read control loop PID and safety protection parameters from each node via SDO
+    and print a comparison table. Nodes must be in NMT Pre-Operational.
+    node_labels: {nid: str} — defaults to AMR_NODES names.
+    """
+    if node_labels is None:
+        node_labels = AMR_NODES
+
+    node_list = sorted(node_ids)
+    labels    = [node_labels.get(n, f'n{n}') for n in node_list]
+
+    print(f"\n  [Control Loop PIDs & Safety]")
+
+    # ── Read all values up front ──────────────────────────────────────────────
+    data = {nid: {} for nid in node_list}
+    for nid in node_list:
+        for _grp, idx, params in _PID_GROUPS:
+            for sub, _meaning in params:
+                data[nid][(idx, sub)] = sdo_read_raw(sock, nid, idx, sub)
+        for idx, sub, _meaning in _SAFETY_PARAMS:
+            data[nid][(idx, sub)] = sdo_read_raw(sock, nid, idx, sub)
+
+    # ── Layout ────────────────────────────────────────────────────────────────
+    COL = 9   # value column width
+    meaning_w = 22
+
+    def _header():
+        hdr = f"  {'':4}  {'meaning':<{meaning_w}}"
+        for lbl in labels:
+            hdr += f"  {lbl:>{COL}}"
+        print(hdr)
+        print(f"  {'-'*4}  {'-'*meaning_w}" + f"  {'-'*COL}" * len(node_list))
+
+    def _row(sub, meaning, idx):
+        vals = [data[nid].get((idx, sub)) for nid in node_list]
+        row = f"  :{sub:02X}   {meaning:<{meaning_w}}"
+        for v in vals:
+            s = str(v) if v is not None else 'N/A'
+            row += f"  {s:>{COL}}"
+        print(row)
+
+    # ── PID groups ────────────────────────────────────────────────────────────
+    for group, idx, params in _PID_GROUPS:
+        print(f"\n  {group}  (0x{idx:04X})")
+        _header()
+        for sub, meaning in params:
+            _row(sub, meaning, idx)
+
+    # ── Safety / protection ───────────────────────────────────────────────────
+    print(f"\n  Safety / Protection")
+    last_idx = None
+    for idx, sub, meaning in _SAFETY_PARAMS:
+        if idx != last_idx:
+            print(f"\n  0x{idx:04X}")
+            _header()
+            last_idx = idx
+        _row(sub, meaning, idx)
+
+
+# ── Tool state SDO check (CiA 301 — node 8 on can1) ──────────────────────────
+
+def check_tool_state(sock, nid=8):
+    """
+    Check tool node state.
+    SDO-readable: Tool ID (0x2020), temperature (0x2022), uptime (0x2021),
+                  latch feedback (0x2001), bucket feedback (0x2008).
+    TPDO1-only (PDO-mapped, not SDO-readable): status_word (0x6003),
+                  mode_display (0x6004), actual_target (0x6005).
+    → NMT Start + SYNC to capture TPDO1 (COB 0x180+nid, tx_type=0x01).
+    """
+    print(f"\n  [Tool node {nid} — state]")
+
+    # ── SDO-accessible objects (node in Pre-Operational) ──────────────────────
+    tool_id = sdo_read_raw(sock, nid, 0x2020, 0)
+    if tool_id is None:
+        result(False, f"Tool        node {nid}  no SDO response — tool disconnected?")
+        return
+
+    tool_name = _TOOL_ID_NAMES.get(tool_id, f'Unknown(0x{tool_id:02X})')
+    if tool_id == 0x00:
+        result(True, f"Tool        node {nid}  no tool attached")
+        return
+
+    result(True, f"Tool        node {nid}  type: {tool_name} (0x{tool_id:02X})")
+
+    temp_raw     = sdo_read_raw(sock, nid, 0x2022, 0)
+    up_raw       = sdo_read_raw(sock, nid, 0x2021, 0)
+    humidity_raw = sdo_read_raw(sock, nid, 0x2009, 0)
+    bucket_temp_raw = sdo_read_raw(sock, nid, 0x200A, 0)
+
+    latch_fb  = sdo_read_raw(sock, nid, 0x2001, 0)
+    bucket_fb = sdo_read_raw(sock, nid, 0x2008, 0)
+
+    # ── TPDO1: NMT Start → SYNC → capture frame ──────────────────────────────
+    send_nmt(sock, NMT_START, nid)
+    time.sleep(0.05)
+
+    tpdo1_cob = 0x180 + nid   # 0x188 for node 8
+    tpdo1_raw = None
+    orig = sock.gettimeout()
+    sock.settimeout(0.005)
+    try:
+        for _ in range(10):
+            sock.send(_SYNC_FRAME)
+            deadline = time.monotonic() + 0.004
+            while time.monotonic() < deadline:
+                try:
+                    raw = sock.recv(FRAME_SZ)
+                    rid, dlc, frame_payload = struct.unpack(CAN_FRAME_FMT, raw)
+                    if (rid & 0x1FFFFFFF) == tpdo1_cob:
+                        tpdo1_raw = frame_payload[:dlc]
+                        break
+                except (socket.timeout, BlockingIOError):
+                    break
+            if tpdo1_raw:
+                break
+            time.sleep(0.002)
+    finally:
+        sock.settimeout(orig)
+        send_nmt(sock, NMT_PRE_OP, nid)
+
+    # ── Decode TPDO1: U16 status_word | U8 mode_display | U8 pad | I32 actual_target
+    sw_raw = mode_disp = actual_target = None
+    if tpdo1_raw and len(tpdo1_raw) >= 8:
+        sw_raw        = struct.unpack_from('<H', tpdo1_raw, 0)[0]
+        mode_disp     = tpdo1_raw[2]
+        actual_target = struct.unpack_from('<i', tpdo1_raw, 4)[0]
+
+    if sw_raw is None:
+        result(False, f"Tool        node {nid}  no TPDO1 received — status unknown")
+    else:
+        state_code = sw_raw & 0x00FF
+        state_name = _TOOL_STATUS.get(state_code, f'Unknown(0x{state_code:02X})')
+        result(state_code != 0xFF,
+               f"Tool        node {nid}  status: {state_name} (sw=0x{sw_raw:04X})")
+
+    def _s8(v):  return v - 256   if (v is not None and v > 127)   else v
+    def _s16(v): return v - 65536 if (v is not None and v > 32767) else v
+
+    rows = []
+    if mode_disp     is not None: rows.append(('mode_display',    f'0x{mode_disp:02X}'))
+    if actual_target is not None: rows.append(('actual_target',   str(actual_target)))
+    rows.append(('temperature_c',   str(_s8(temp_raw))        if temp_raw        is not None else 'N/A'))
+    if humidity_raw is None:
+        hum_s = 'N/A'
+    elif humidity_raw == 0x7F:
+        hum_s = 'N/A (boot — waiting for first DHT22 reading)'
+    else:
+        hum_s = f'{_s8(humidity_raw)} %RH'
+    rows.append(('humidity_rh',     hum_s))
+    if bucket_temp_raw is None:
+        bkt_s = 'N/A'
+    elif bucket_temp_raw == 0x7F:
+        bkt_s = 'N/A (boot — waiting for first DHT22 reading)'
+    else:
+        bkt_s = f'{_s8(bucket_temp_raw)} °C'
+    rows.append(('bucket_temp_c',   bkt_s))
+    rows.append(('uptime_h',        str(_s16(up_raw))         if up_raw          is not None else 'N/A'))
+    rows.append(('latch_fb',  f'0x{latch_fb:02X}'  if latch_fb  is not None else 'N/A'))
+    rows.append(('bucket_fb', f'0x{bucket_fb:02X}' if bucket_fb is not None else 'N/A'))
+
+    col = max(len(k) for k, _ in rows)
+    for key, val in rows:
+        print(f"    {key:<{col}}  {val}")
+
+
+# ── Tool electromechanical test helpers ───────────────────────────────────────
+
+def _send_tool_cw(sock, cw, mode=_MODE_NORMAL, nid=8):
+    """Send Control_Word + Mode via RPDO2 (COB 0x308, event-driven — no SYNC needed)."""
+    payload = struct.pack('<HB5x', cw & 0xFFFF, mode & 0xFF)
+    sock.send(struct.pack('=IB3x8s', 0x300 + nid, 8, payload))
+
+
+def _send_tool_target(sock, level, nid=8):
+    """Write Target_Value (uint32) via RPDO1 (COB 0x200+nid, SYNC-latched). Send SYNC after."""
+    payload = struct.pack('<I4x', int(level) & 0xFFFFFFFF)
+    sock.send(struct.pack('=IB3x8s', 0x200 + nid, 8, payload))
+
+
+def _capture_tpdo1(sock, nid=8, attempts=10):
+    """Send SYNC → capture TPDO1 (COB 0x180+nid). Returns raw bytes or None."""
+    cob = 0x180 + nid
+    orig = sock.gettimeout()
+    sock.settimeout(0.005)
+    tpdo1_raw = None
+    try:
+        for _ in range(attempts):
+            sock.send(_SYNC_FRAME)
+            deadline = time.monotonic() + 0.005
+            while time.monotonic() < deadline:
+                try:
+                    raw = sock.recv(FRAME_SZ)
+                    rid, dlc, pl = struct.unpack(CAN_FRAME_FMT, raw)
+                    if (rid & 0x1FFFFFFF) == cob:
+                        tpdo1_raw = pl[:dlc]
+                        break
+                except (socket.timeout, BlockingIOError):
+                    break
+            if tpdo1_raw:
+                break
+            time.sleep(0.003)
+    finally:
+        sock.settimeout(orig)
+    return tpdo1_raw
+
+
+def _capture_tpdo4(sock, nid=8, timeout=0.5):
+    """Wait for TPDO4 event frame (COB 0x480+nid, fires every ~100ms). Returns raw bytes or None."""
+    cob = 0x480 + nid
+    orig = sock.gettimeout()
+    sock.settimeout(0.12)
+    tpdo4_raw = None
+    deadline = time.monotonic() + timeout
+    try:
+        while time.monotonic() < deadline:
+            try:
+                raw = sock.recv(FRAME_SZ)
+                rid, dlc, pl = struct.unpack(CAN_FRAME_FMT, raw)
+                if (rid & 0x1FFFFFFF) == cob:
+                    tpdo4_raw = pl[:dlc]
+                    break
+            except socket.timeout:
+                pass
+    finally:
+        sock.settimeout(orig)
+    return tpdo4_raw
+
+
+def _wait_tool_status(sock, nid, accept, timeout=3.0):
+    """Poll TPDO1 until status byte 0 is in `accept` set, or timeout. Returns status code."""
+    deadline = time.monotonic() + timeout
+    while time.monotonic() < deadline:
+        raw = _capture_tpdo1(sock, nid)
+        if raw and len(raw) >= 1:
+            code = raw[0]
+            if code in accept:
+                return code
+        time.sleep(0.05)
+    raw = _capture_tpdo1(sock, nid)
+    return raw[0] if (raw and len(raw) >= 1) else None
+
+
+def _status_str(raw, offset=0):
+    """Decode status word byte from TPDO1 raw payload."""
+    if raw is None or len(raw) <= offset:
+        return 'N/A'
+    code = raw[offset]
+    return f"{_TOOL_STATUS.get(code, f'0x{code:02X}')}(0x{code:02X})"
+
+
+def _tool_init(sock, nid, timeout=5.0):
+    """
+    Send CW=0x0000 (kInit) with mode=kNormal and wait for status Ready (0x02).
+    Raises _EmTestAborted if tool does not reach Ready within timeout.
+    """
+    print("  Sending kInit (CW=0x0000, mode=kNormal)...")
+    _send_tool_cw(sock, _CW_INIT, _MODE_NORMAL, nid)
+    code = _wait_tool_status(sock, nid, {0x02}, timeout=timeout)
+    if code != 0x02:
+        status_s = _TOOL_STATUS.get(code, f'0x{code:02X}') if code is not None else 'N/A'
+        raise _EmTestAborted(f"tool did not reach Ready — status={status_s}")
+    print("  Tool status: Ready (0x02) ✓")
+
+
+def _latch_test(sock, nid, label, engage_mask):
+    """SDO latch engage → read FB → release → read FB. Returns pass bool."""
+    ok_w = sdo_write_u8(sock, nid, 0x2000, 0, engage_mask)
+    time.sleep(0.3)
+    fb_eng = sdo_read_raw(sock, nid, 0x2001, 0)
+    sdo_write_u8(sock, nid, 0x2000, 0, 0x00)
+    time.sleep(0.3)
+    fb_rel = sdo_read_raw(sock, nid, 0x2001, 0)
+    ok = ok_w and fb_eng is not None
+    eng_s = f'0x{fb_eng:02X}' if fb_eng is not None else 'N/A'
+    rel_s = f'0x{fb_rel:02X}' if fb_rel is not None else 'N/A'
+    result(ok, f"{label:<14} engage_fb={eng_s}  release_fb={rel_s}")
+    return ok
+
+
+class _EmTestAborted(Exception):
+    pass
+
+
+def _confirm(prompt):
+    """Ask operator Y/N. Returns True for yes, False otherwise."""
+    try:
+        return input(f"     → {prompt} (y/N): ").strip().lower() == 'y'
+    except (EOFError, KeyboardInterrupt):
+        print()
+        return False
+
+
+def _step(ok, label):
+    """Record result and abort remaining steps if operator confirmed failure."""
+    result(ok, label)
+    if not ok:
+        raise _EmTestAborted(label)
+
+
+def _move_bucket(sock, nid, down, timeout=9.0, poll_interval=0.2):
+    """
+    Write bucket command to 0x2007 then poll 0x2007 until position is confirmed.
+    0x00=UP, 0x01=DOWN, 0xFF=transitioning/error.
+    Also reads 0x2008 (BucketFb bitmask) for physical feedback visibility.
+    Returns final 0x2007 readback value, or None if SDO write failed.
+    """
+    cmd      = 0x01 if down else 0x00
+    expected = 0x01 if down else 0x00
+    direction = 'DOWN' if down else 'UP'
+    ack = sdo_write_u8(sock, nid, 0x2007, 0, cmd)
+    if not ack:
+        print(f"     SDO write 0x2007=0x{cmd:02X} FAILED — no ack from tool")
+        return None
+    print(f"     SDO write 0x2007=0x{cmd:02X} ({direction}) → ACK OK")
+    time.sleep(0.05)
+    deadline = time.monotonic() + timeout
+    ctrl = None
+    while time.monotonic() < deadline:
+        ctrl = sdo_read_raw(sock, nid, 0x2007, 0)
+        fb8  = sdo_read_raw(sock, nid, 0x2008, 0)
+        ctrl_s = f'0x{ctrl:02X}' if ctrl is not None else 'N/A'
+        fb8_s  = f'0x{fb8:02X}'  if fb8  is not None else 'N/A'
+        if ctrl is None:
+            print(f"     bucket_ctrl=N/A  bucket_fb={fb8_s} (no SDO response for 0x2007)")
+        elif ctrl == 0xFF:
+            print(f"     bucket_ctrl={ctrl_s}(transitioning)  bucket_fb={fb8_s}")
+        elif ctrl == expected:
+            print(f"     bucket_ctrl={ctrl_s} ({direction} confirmed)  bucket_fb={fb8_s}")
+            return ctrl
+        else:
+            print(f"     bucket_ctrl={ctrl_s}  bucket_fb={fb8_s}")
+        time.sleep(poll_interval)
+    ctrl_s = f'0x{ctrl:02X}' if ctrl is not None else 'N/A'
+    fb8 = sdo_read_raw(sock, nid, 0x2008, 0)
+    fb8_s = f'0x{fb8:02X}' if fb8 is not None else 'N/A'
+    print(f"     timeout after {timeout:.0f} s — bucket_ctrl={ctrl_s}  bucket_fb={fb8_s}")
+    return ctrl
+
+
+_HMI_BTN_NAMES = {0: 'BTN1', 1: 'BTN2', 2: 'BTN3', 3: 'BTN4', 4: 'BTN5(ROS)', 5: 'BTN6'}
+
+# Three buttons tested in sequence during the HMI check.
+_HMI_TEST_SEQ = [(0x01, 'BTN1'), (0x02, 'BTN2'), (0x04, 'BTN3')]
+
+
+def _hmi_button_check(sock, nid, timeout=15.0):
+    """
+    Ask the operator to press 3 specific buttons in sequence.
+    Polls 0x2002 via SDO; logs wrong presses and waits for the correct one.
+    Returns True if all 3 buttons were confirmed, False if any timed out.
+    """
+    all_ok = True
+    for mask, name in _HMI_TEST_SEQ:
+        print(f"\n     → Press {name} now...")
+        last = -1
+        deadline = time.monotonic() + timeout
+        confirmed = False
+        while time.monotonic() < deadline:
+            val = sdo_read_raw(sock, nid, 0x2002, 0, timeout=0.05)
+            if val is None or val == last:
+                continue
+            last = val
+            if val == 0:
+                continue  # waiting for a press
+            pressed = [_HMI_BTN_NAMES[i] for i in range(6) if val & (1 << i)]
+            if val == mask:
+                print(f"     {PASS} {name} detected")
+                # wait for full release before moving to the next button
+                while time.monotonic() < deadline:
+                    v = sdo_read_raw(sock, nid, 0x2002, 0, timeout=0.05)
+                    if v == 0:
+                        break
+                confirmed = True
+                break
+            else:
+                print(f"     {FAIL} Wrong button pressed: {'  '.join(pressed)}  (expected {name})")
+        if not confirmed:
+            print(f"     [!] {name} — no response within {timeout:.0f} s")
+            all_ok = False
+    return all_ok
+
+
+def _read_load_cell(sock, nid):
+    """Read load cell raw counts via SDO 0x200E:0 (INT32, node 8). Returns int or None."""
+    raw = sdo_read_raw(sock, nid, 0x200E, 0)
+    if raw is None:
+        return None
+    # sdo_read_raw returns unsigned; sign-extend to INT32
+    return raw - (1 << 32) if raw >= (1 << 31) else raw
+
+
+def _read_latch_fb(sock, nid, attempts=5, delay=0.2):
+    """Retry SDO read of Latch_FB (0x2001) — firmware may be busy during actuation."""
+    for _ in range(attempts):
+        fb = sdo_read_raw(sock, nid, 0x2001, 0)
+        if fb is not None:
+            return fb
+        time.sleep(delay)
+    return None
+
+
+def _latch_checks(sock, nid):
+    """TS_Latch and AMR_Latch engage checks (shared by sprayer and sander)."""
+    print("\n  TS_Latch L & R")
+    print("     Engaging TS latches (L + R)...")
+    sdo_write_u8(sock, nid, 0x2000, 0, _LATCH_TS)
+    time.sleep(1.0)
+    fb = _read_latch_fb(sock, nid)
+    print(f"     latch_fb = 0x{fb:02X}" if fb is not None else "     latch_fb = N/A")
+    _step(_confirm("TS latches ENGAGED (L & R)?"), "TS_Latch engage")
+
+    print("\n  AMR_Latch L & R")
+    print("     Engaging AMR latches (L + R)...")
+    sdo_write_u8(sock, nid, 0x2000, 0, _LATCH_AMR)
+    time.sleep(1.0)
+    fb = _read_latch_fb(sock, nid)
+    print(f"     latch_fb = 0x{fb:02X}" if fb is not None else "     latch_fb = N/A")
+    _step(_confirm("AMR latches ENGAGED (L & R)?"), "AMR_Latch engage")
+
+
+def _emtest_sprayer(sock, nid):
+    """Per-step interactive electromechanical checks for Sprayer tool."""
+    _tool_init(sock, nid)
+
+    # ── a. Bucket down / up ───────────────────────────────────────────────────
+    print("\n  a. Bucket")
+    print("     Commanding BUCKET DOWN...")
+    _move_bucket(sock, nid, down=True)
+    _step(_confirm("Bucket moved DOWN?"), "Bucket down")
+
+    print("     Commanding BUCKET UP...")
+    _move_bucket(sock, nid, down=False)
+    _step(_confirm("Bucket moved UP?"), "Bucket up")
+
+    # ── b. EoA Valve ─────────────────────────────────────────────────────────
+    print("\n  b. EoA Valve")
+    print("     Sending SprayerON...")
+    _send_tool_cw(sock, _CW_SPRAYER_ON, _MODE_NORMAL, nid)
+    time.sleep(0.5)
+    raw = _capture_tpdo1(sock, nid)
+    print(f"     status = {_status_str(raw)}")
+    _step(_confirm("Valve OPENED / spraying?"), "EoA Valve open")
+
+    print("     Sending SprayerOFF...")
+    _send_tool_cw(sock, _CW_SPRAYER_OFF, _MODE_NORMAL, nid)
+    time.sleep(0.5)
+    raw = _capture_tpdo1(sock, nid)
+    print(f"     status = {_status_str(raw)}")
+    _step(_confirm("Valve CLOSED?"), "EoA Valve close")
+
+    # ── c. Load cell ─────────────────────────────────────────────────────────
+    print("\n  c. Load cell")
+    print("     Reading load cell via SDO 0x200E:0...")
+    counts = _read_load_cell(sock, nid)
+    if counts is not None:
+        print(f"     load_cell = {counts} counts")
+    else:
+        print("     No SDO response for 0x200E:0 — load cell not responding")
+    _step(_confirm("Load cell reading OK?"), "Load cell")
+
+
+    # ── d. Latches (last) ────────────────────────────────────────────────────
+    _latch_checks(sock, nid)
+
+
+def _emtest_sander(sock, nid):
+    """Per-step interactive electromechanical checks for Sander tool."""
+    _tool_init(sock, nid)
+
+    # ── a. Sander On / Off ───────────────────────────────────────────────────
+    print("\n  a. Sander On/Off")
+    print("     Sending PowerON...")
+    _send_tool_cw(sock, _CW_SANDER_ON, _MODE_NORMAL, nid)
+    time.sleep(1.0)
+    raw = _capture_tpdo1(sock, nid)
+    print(f"     status = {_status_str(raw)}")
+    _step(_confirm("Sander motor RUNNING?"), "Sander On")
+
+    print("     Sending PowerOFF...")
+    _send_tool_cw(sock, _CW_SANDER_OFF, _MODE_NORMAL, nid)
+    time.sleep(1.0)
+    raw = _capture_tpdo1(sock, nid)
+    print(f"     status = {_status_str(raw)}")
+    _step(_confirm("Sander motor STOPPED?"), "Sander Off")
+
+    # ── b. Speed control levels 1–7 ──────────────────────────────────────────
+    print("\n  b. Speed control (levels 1–7)")
+    print("     Powering ON sander for speed test...")
+    _send_tool_cw(sock, _CW_SANDER_ON, _MODE_NORMAL, nid)
+    _wait_tool_status(sock, nid, {0x03, 0x11}, timeout=2.0)
+    for level in range(1, 8):
+        _send_tool_target(sock, level, nid)
+        sock.send(_SYNC_FRAME)
+        time.sleep(0.02)
+        _send_tool_cw(sock, _CW_SANDER_SPEED, _MODE_NORMAL, nid)
+        time.sleep(0.3)
+        raw = _capture_tpdo1(sock, nid)
+        actual = struct.unpack_from('<i', raw, 4)[0] if (raw and len(raw) >= 8) else None
+        actual_s = str(actual) if actual is not None else 'N/A'
+        print(f"     Level {level}: commanded={level}  actual_target={actual_s}")
+    print("     Powering OFF sander...")
+    _send_tool_cw(sock, _CW_SANDER_OFF, _MODE_NORMAL, nid)
+    _wait_tool_status(sock, nid, {0x00, 0x02, 0x12}, timeout=2.0)
+    _step(_confirm("Speed control worked across all levels?"), "Speed L1-7")
+
+    # ── c. Load cell ─────────────────────────────────────────────────────────
+    print("\n  c. Load cell")
+    print("     Reading load cell via SDO 0x200E:0...")
+    counts = _read_load_cell(sock, nid)
+    if counts is not None:
+        print(f"     load_cell = {counts} counts")
+    else:
+        print("     No SDO response for 0x200E:0 — load cell not responding")
+    _step(_confirm("Load cell reading OK?"), "Load cell")
+
+
+    # ── d. TS_Latch + AMR_Latch (last) ───────────────────────────────────────
+    _latch_checks(sock, nid)
+
+
+class _SyncKeepAlive:
+    """
+    Context manager: sends SYNC (COB 0x080) every 2 ms on a dedicated socket.
+    Keeps the tool node in Operational — it transitions to NMT Stopped if the
+    SYNC watchdog expires (~a few missed cycles).  Uses its own socket so the
+    main socket's recv buffer is not polluted and there is no send/recv race.
+    """
+    _INTERVAL_S = 0.002
+
+    def __init__(self, iface):
+        self._iface = iface
+        self._stop  = threading.Event()
+        self._sock  = None
+        self._thread = None
+
+    def start(self):
+        self._sock = socket.socket(socket.AF_CAN, socket.SOCK_RAW, socket.CAN_RAW)
+        self._sock.bind((self._iface,))
+        self._stop.clear()
+        self._thread = threading.Thread(target=self._run, daemon=True, name='sync-keepalive')
+        self._thread.start()
+
+    def stop(self):
+        self._stop.set()
+        if self._thread:
+            self._thread.join(timeout=1.0)
+        if self._sock:
+            try:
+                self._sock.close()
+            except OSError:
+                pass
+
+    def _run(self):
+        target = time.monotonic()
+        while not self._stop.is_set():
+            try:
+                self._sock.send(_SYNC_FRAME)
+            except OSError:
+                break
+            target += self._INTERVAL_S
+            slack = target - time.monotonic()
+            if slack > 0:
+                time.sleep(slack)
+            else:
+                target = time.monotonic()  # reset if we fall behind
+
+    def __enter__(self):
+        self.start()
+        return self
+
+    def __exit__(self, *_):
+        self.stop()
+
+
+def run_tool_emtest(skip_tool=False, nid=8, iface='can1'):
+    """
+    Interactive electromechanical test — runs at the very end of preflight.
+    Opens its own CAN socket, detects tool type, prompts Y/N, then steps
+    through each actuator check one at a time asking the operator to confirm.
+    All physical state is restored on exit (even on Ctrl+C).
+    """
+    if skip_tool:
+        return
+
+    print("\n[TOOL ELECTROMECHANICAL TEST]")
+
+    if not can_interface_up(iface):
+        print(f"  [skip] {iface} interface is down")
+        return
+
+    try:
+        sock = _open_can_socket(iface)
+    except Exception as exc:
+        print(f"  [skip] socket error: {exc}")
+        return
+
+    try:
+        send_nmt(sock, NMT_PRE_OP, nid)
+        time.sleep(0.1)
+        tool_id = sdo_read_raw(sock, nid, 0x2020, 0)
+
+        if tool_id is None:
+            print("  No SDO response from tool node — tool not connected, skipping.")
+            return
+        if tool_id == 0x00:
+            print("  No tool attached (tool ID = 0x00), skipping.")
+            return
+
+        tool_name = _TOOL_ID_NAMES.get(tool_id, f'Unknown(0x{tool_id:02X})')
+        print(f"  Tool detected: {tool_name} (ID=0x{tool_id:02X})")
+        print(f"  Ensure the arm is retracted and the work area is clear.")
+        try:
+            ans = input("  Run electromechanical test? (y/N): ").strip().lower()
+        except (EOFError, KeyboardInterrupt):
+            print()
+            return
+        if ans != 'y':
+            print("  Skipped.")
+            return
+
+        send_nmt(sock, NMT_START, nid)
+        time.sleep(0.1)
+        with _SyncKeepAlive(iface):
+            try:
+                if tool_id == 0x02:
+                    _emtest_sprayer(sock, nid)
+                elif tool_id == 0x01:
+                    _emtest_sander(sock, nid)
+                else:
+                    print(f"  [warn] No E-M test defined for tool ID 0x{tool_id:02X}")
+            except _EmTestAborted as exc:
+                print(f"\n  [!] Test aborted after failure: {exc}")
+                print(f"  [!] Restoring tool state...")
+            finally:
+                # ── Restore physical state while SYNC is still running ────────
+                send_nmt(sock, NMT_START, nid)      # ensure Operational for SDO
+                time.sleep(0.1)
+                sdo_write_u8(sock, nid, 0x2000, 0, 0x00)   # release all latches
+                if tool_id == 0x02:
+                    _move_bucket(sock, nid, down=False)
+                    _send_tool_cw(sock, _CW_SPRAYER_OFF, _MODE_NORMAL, nid)
+                elif tool_id == 0x01:
+                    _send_tool_cw(sock, _CW_SANDER_OFF, _MODE_NORMAL, nid)
+                time.sleep(0.3)
+                # NMT_PRE_OP sent after HMI check below — node must stay
+                # Operational so TPDO4 can still fire.
+
+        # ── HMI buttons — SYNC stopped, sequential button check ─────────────
+        print("\n  HMI buttons")
+        print("     You will be asked to press 3 buttons in sequence (15 s each).")
+        _step(_hmi_button_check(sock, nid), "HMI buttons")
+    finally:
+        send_nmt(sock, NMT_PRE_OP, nid)
+        sock.close()
+
+
+# ── Liftkit ───────────────────────────────────────────────────────────────────
+
+def check_liftkit(skip_tool):
+    print("\n[LIFTKIT (can1)]")
+    iface = 'can1'
+    nodes = {7: 'Lift motor'} if skip_tool else {7: 'Lift motor', 8: 'Tool'}
+
+    up = can_interface_up(iface)
+    result(up, "Interface UP")
+    if not up:
+        for nid, label in nodes.items():
+            result(False, f"{label:<11} node {nid}  statusword — skipped (interface down)")
+        return
+
+    try:
+        sock = _open_can_socket(iface)
+    except Exception as exc:
+        for nid, label in nodes.items():
+            result(False, f"{label:<11} node {nid}  statusword — socket error: {exc}")
+        return
+
+    try:
+        for nid in nodes:
+            send_nmt(sock, NMT_PRE_OP, nid)
+        time.sleep(0.1)
+
+        check_statusword_sock(sock, 7, 'Lift motor')
+        if not skip_tool:
+            check_tool_state(sock, nid=8)
+
+        # PID readout — motor node 7 only (tool node 8 is not a CiA 402 drive)
+        check_motor_pids(sock, [n for n in nodes if n == 7],
+                         node_labels={7: 'lift_motor'})
+
+        tpdo1 = {nid: LIFTKIT_TPDO1[nid] for nid in nodes if nid in LIFTKIT_TPDO1}
+        tpdo2 = {nid: LIFTKIT_TPDO2[nid] for nid in nodes if nid in LIFTKIT_TPDO2}
+        run_can_timing_test(sock, 'can1', list(nodes.keys()), tpdo1_map=tpdo1, tpdo2_map=tpdo2)
+    finally:
+        sock.close()
+
+# ── AMR ───────────────────────────────────────────────────────────────────────
+
+def check_amr():
+    print("\n[AMR (can0)]")
+    iface = 'can0'
+
+    up = can_interface_up(iface)
+    result(up, "Interface UP")
+    if not up:
+        for nid, name in AMR_NODES.items():
+            result(False, f"{name:<11} node {nid}  statusword — skipped (interface down)")
+        result(False, "Home offsets — skipped (interface down)")
+        return
+
+    try:
+        sock = _open_can_socket(iface)
+    except Exception as exc:
+        for nid, name in AMR_NODES.items():
+            result(False, f"{name:<11} node {nid}  statusword — socket error: {exc}")
+        result(False, f"Home offsets — socket error: {exc}")
+        return
+
+    try:
+        send_nmt(sock, NMT_PRE_OP, 0)
+        time.sleep(0.1)
+
+        for nid, name in AMR_NODES.items():
+            check_statusword_sock(sock, nid, name)
+
+        check_motor_pids(sock, list(AMR_NODES.keys()))
+
+        _run_steering_homing(sock)
+
+        send_nmt(sock, NMT_PRE_OP, 0)
+        time.sleep(0.1)
+
+        for nid in sorted(REQUIRED_STEERING_NODES):
+            sdo_write_i32(sock, nid, 0x6081, 0, 0)
+
+        run_can_timing_test(sock, 'can0', list(AMR_NODES.keys()),
+                            tpdo1_map=AMR_TPDO1, tpdo2_map=AMR_TPDO2)
+    finally:
+        sock.close()
+
+
+def _await_statusword(sock, nid, mask, expected, timeout=2.0, label=''):
+    """Poll statusword until (sw & mask) == expected. Returns final sw or None on timeout."""
+    deadline = time.monotonic() + timeout
+    while time.monotonic() < deadline:
+        sw = sdo_read_u16(sock, nid, 0x6041, 0)
+        if sw is not None and (sw & mask) == expected:
+            return sw
+        time.sleep(0.02)
+    sw = sdo_read_u16(sock, nid, 0x6041, 0)
+    print(f"  [warn] node {nid} {label} state timeout  sw=0x{sw:04X}" if sw is not None
+          else f"  [warn] node {nid} {label} state timeout  sw=<no response>")
+    return None
+
+
+def _run_steering_homing(sock):
+    """Command each steering node to position 0 and verify arrival via CiA 402."""
+    _STEER_PROFILE_VEL   = int(1000 * 512 * 92500 / 1875)  # 25 173 333
+    _STEER_PROFILE_ACCEL = int(1515.52 * 100)               # 151 552
+
+    print("\n  [Homing steering motors — nodes 2, 4, 6]")
+    for nid in sorted(REQUIRED_STEERING_NODES):
+        name = AMR_NODES[nid]
+        target = 0
+
+        send_nmt(sock, NMT_START, nid)
+        time.sleep(0.1)
+
+        sdo_write_i8(sock, nid, 0x6060, 0, 1)
+
+        sdo_write_u16(sock, nid, 0x6040, 0, 0x0080)
+        _await_statusword(sock, nid, 0x0008, 0x0000, label='FaultReset')
+
+        sdo_write_u16(sock, nid, 0x6040, 0, 0x0006)
+        _await_statusword(sock, nid, 0x006F, 0x0021, label='Ready-to-Switch-On')
+
+        sdo_write_i32(sock, nid, 0x607A, 0, target)
+        sdo_write_i32(sock, nid, 0x6081, 0, _STEER_PROFILE_VEL)
+        sdo_write_i32(sock, nid, 0x6083, 0, _STEER_PROFILE_ACCEL)
+        sdo_write_i32(sock, nid, 0x6084, 0, _STEER_PROFILE_ACCEL)
+
+        sdo_write_u16(sock, nid, 0x6040, 0, 0x103F)
+
+        deadline = time.monotonic() + 30.0
+        reached = False
+        while time.monotonic() < deadline:
+            sw = sdo_read_u16(sock, nid, 0x6041, 0)
+            if sw is not None and (sw & 0x0400):
+                reached = True
+                break
+            time.sleep(0.1)
+
+        if not reached:
+            result(False, f"{name:<11} node {nid}  homing failed (timeout)")
+        else:
+            result(True, f"{name:<11} node {nid}  homed")
+
+        sdo_write_u16(sock, nid, 0x6040, 0, 0x0006)
+        time.sleep(0.05)
+        send_nmt(sock, NMT_PRE_OP, nid)
+        time.sleep(0.05)
+
+    try:
+        answer = input("\n  Visually confirm: are all steering motors at home position? [y/n]: ").strip().lower()
+    except EOFError:
+        answer = 'n'
+    result(answer == 'y', "Operator confirmed steering motors at home position")
+
+# ── Entry point ───────────────────────────────────────────────────────────────
+
+def main():
+    parser = argparse.ArgumentParser(description=TITLE)
+    parser.add_argument('--skip-ur',      action='store_true', help='Skip UR arm checks')
+    parser.add_argument('--skip-liftkit', action='store_true', help='Skip liftkit CAN checks')
+    parser.add_argument('--skip-amr',     action='store_true', help='Skip AMR CAN checks')
+    parser.add_argument('--skip-tool',    action='store_true', help='Skip tool node 8 check')
+    parser.add_argument('--ur-ip',        default='192.168.4.102', metavar='IP',
+                        help='UR controller IP (default: 192.168.4.102)')
+    args = parser.parse_args()
+
+    banner = '═' * (len(TITLE) + 4)
+    print(f"\n{banner}")
+    print(f"  {TITLE}")
+    print(banner)
+
+    if not args.skip_ur:
+        check_ur(args.ur_ip)
+    else:
+        print("\n[UR ARM — skipped]")
+
+    if not args.skip_liftkit:
+        check_liftkit(skip_tool=args.skip_tool)
+    else:
+        print("\n[LIFTKIT (can1) — skipped]")
+
+    if not args.skip_amr:
+        check_amr()
+    else:
+        print("\n[AMR (can0) — skipped]")
+
+    print(f"\n{banner}")
+    if _any_failure:
+        print(_red('  PREFLIGHT FAILED — do not launch'))
+    else:
+        print(_green('  ALL SYSTEMS GO — safe to actuate'))
+    print(f"{banner}\n")
+
+    # ── Tool electromechanical test — interactive, always last ────────────────
+    if not args.skip_liftkit:
+        run_tool_emtest(skip_tool=args.skip_tool)
+
+    sys.exit(1 if _any_failure else 0)
+
+
+if __name__ == '__main__':
+    main()

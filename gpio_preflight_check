@@ -1,0 +1,259 @@
+#!/bin/bash
+# ==============================================================================
+# gpio-preflight — Controller Compute GPIO Board Preflight Check
+#
+# Validates all I/O on gpiochip2. Run before every operational session.
+#
+# Usage:  sudo gpio-preflight
+#
+# gpiochip2 pin map
+#   OUTPUTS (controller drives)
+#     Line 0: em_latch        0=engaged (active),  1=released (idle)
+#     Line 1: error_trigger   1=trigger error,     0=safe
+#     Line 2: recovery        0=ON (active),       1=OFF (idle)
+#     Line 3: halt_disable    0=ON (active),       1=OFF (idle)
+#     Line 4: ur_power        0=ON (active),       1=OFF (idle)
+#     Line 5: provision_1     0=ON (active),       1=OFF (idle)
+#     Line 6: dev_mode_out    1=ON,                0=OFF
+#     Line 7: board_init      pulse sequence on startup
+#   INPUTS (controller reads)
+#     Line  8: tool_limit_switch   0=idle,     1=triggered
+#     Line  9: contactor_feedback  1=ON,       0=OFF
+#     Line 10: estop               1=released, 0=triggered
+#     Line 11: actuator_error      1=clear,    0=error
+#     Line 12: bumper              1=clear,    0=triggered
+#     Line 13: dev_mode_in         1=OFF,      0=ON  (confirms line 6 round-trip)
+# ==============================================================================
+
+set -euo pipefail
+
+if [ "$(id -u)" -ne 0 ]; then
+    echo "ERROR: Run as root:  sudo gpio-preflight"
+    exit 1
+fi
+
+CHIP="gpiochip2"
+
+# ── Colours ───────────────────────────────────────────────────────────────────
+RED='\033[0;31m'; GRN='\033[0;32m'; YEL='\033[1;33m'
+CYN='\033[0;36m'; BLD='\033[1m';    RST='\033[0m'
+
+# ── Result tracking ───────────────────────────────────────────────────────────
+PASS_COUNT=0; FAIL_COUNT=0; SKIP_COUNT=0
+declare -a RESULTS=()
+
+# ── Helpers ───────────────────────────────────────────────────────────────────
+info()  { echo -e "${CYN}[INFO]${RST}  $*"; }
+warn()  { echo -e "${YEL}[WARN]${RST}  $*"; }
+step()  { echo -e "\n${BLD}${YEL}━━━ $* ━━━${RST}"; }
+
+read_di() { gpioget "$CHIP" "$1" 2>/dev/null || echo "0"; }
+set_do()  { gpioset  "$CHIP" "$1"="$2"; }
+
+record() {
+    local name="$1" result="$2"
+    RESULTS+=("$name|$result")
+    case "$result" in
+        PASS) echo -e "${GRN}[PASS]${RST}  $name"; PASS_COUNT=$(( PASS_COUNT + 1 )) ;;
+        SKIP) echo -e "${YEL}[SKIP]${RST}  $name"; SKIP_COUNT=$(( SKIP_COUNT + 1 )) ;;
+        *)    echo -e "${RED}[FAIL]${RST}  $name"; FAIL_COUNT=$(( FAIL_COUNT + 1 )) ;;
+    esac
+}
+
+ask() {
+    # ask <prompt> — returns 0 on y/Y, 1 otherwise
+    echo -ne "${YEL}  → ${1} [y/n]: ${RST}"
+    local a; read -r a
+    [[ "$a" =~ ^[Yy]$ ]]
+}
+
+pause() {
+    echo -ne "${YEL}  → Press [Enter] to continue... ${RST}"
+    read -r
+}
+
+safe_state() {
+    set_do 0 1   # em_latch OFF
+    set_do 1 0   # error_trigger safe
+    set_do 2 1   # recovery OFF
+    set_do 3 1   # halt_disable OFF
+    set_do 6 0   # dev_mode_out OFF
+}
+
+# ==============================================================================
+echo -e "\n${BLD}Controller Compute GPIO Board — Preflight Check${RST}"
+echo    "Board: gpiochip2  |  $(date '+%Y-%m-%d %H:%M:%S')  |  Host: $(hostname)"
+echo    "═══════════════════════════════════════════════════════"
+
+# ──────────────────────────────────────────────────────────────────────────────
+step "0. Prerequisites"
+# ──────────────────────────────────────────────────────────────────────────────
+
+if gpiodetect 2>/dev/null | grep -q "gpiochip2"; then
+    record "gpiochip2 accessible" "PASS"
+else
+    record "gpiochip2 accessible" "FAIL"
+    echo -e "${RED}Cannot access gpiochip2 — check board connection. Aborting.${RST}"
+    exit 1
+fi
+
+info "Verify 24V supply is connected to the XT30 power connector."
+pause
+if ask "24V supply connected and powered on?"; then
+    record "24V power supply (manual check)" "PASS"
+else
+    record "24V power supply (manual check)" "FAIL"
+    echo -e "${RED}Connect 24V supply before proceeding. Aborting.${RST}"
+    exit 1
+fi
+
+# ──────────────────────────────────────────────────────────────────────────────
+step "1. Board Initialization  (line 7 — pulse)"
+# ──────────────────────────────────────────────────────────────────────────────
+
+info "Pulsing board-init line (0 → 1 → 0)..."
+set_do 7 0; sleep 0.2
+set_do 7 1; sleep 0.2
+set_do 7 0
+record "Board init pulse (line 7)" "PASS"
+
+# ──────────────────────────────────────────────────────────────────────────────
+step "2. Output Safe-State Reset"
+# ──────────────────────────────────────────────────────────────────────────────
+
+info "Driving all outputs to safe/idle state..."
+safe_state
+record "All outputs → safe default" "PASS"
+
+# ──────────────────────────────────────────────────────────────────────────────
+step "3. Input Default States  (automated)"
+# ──────────────────────────────────────────────────────────────────────────────
+
+warn "Ensure: E-Stop released, no actuator errors, bumper clear, dev mode OFF."
+pause
+
+v=$(read_di 10)
+[ "$v" -eq 1 ] && record "E-Stop        line 10 = 1 (released)" "PASS" \
+               || record "E-Stop        line 10 = $v  [expected 1]" "FAIL"
+
+v=$(read_di 12)
+[ "$v" -eq 1 ] && record "Bumper        line 12 = 1 (clear)" "PASS" \
+               || record "Bumper        line 12 = $v  [expected 1]" "FAIL"
+
+v=$(read_di 13)
+[ "$v" -eq 1 ] && record "Dev mode in   line 13 = 1 (OFF)" "PASS" \
+               || record "Dev mode in   line 13 = $v  [expected 1]" "FAIL"
+
+v=$(read_di 8)
+[ "$v" -eq 0 ] && record "Limit switch  line  8 = 0 (idle)" "PASS" \
+               || record "Limit switch  line  8 = $v  [expected 0]" "FAIL"
+
+v=$(read_di 9)
+info "Contactor feedback  line 9 = $v  (1=ON, 0=OFF) — recorded for reference."
+record "Contactor feedback line 9 readable" "PASS"
+
+# ──────────────────────────────────────────────────────────────────────────────
+step "4. Tool Limit Switch  (line 8)"
+# ──────────────────────────────────────────────────────────────────────────────
+
+info "Press and HOLD the tool-docking limit switch."
+pause
+v=$(read_di 8)
+[ "$v" -eq 1 ] && record "Limit switch triggered  line 8 = 1" "PASS" \
+               || record "Limit switch triggered  line 8 = $v  [expected 1]" "FAIL"
+
+info "Release the limit switch."
+pause
+v=$(read_di 8)
+[ "$v" -eq 0 ] && record "Limit switch released   line 8 = 0" "PASS" \
+               || record "Limit switch released   line 8 = $v  [expected 0]" "FAIL"
+
+# ──────────────────────────────────────────────────────────────────────────────
+step "6. Contactor Feedback  (line 9 — CONTR)"
+# ──────────────────────────────────────────────────────────────────────────────
+
+info "Close the contactor (ON state) now."
+pause
+v=$(read_di 9)
+[ "$v" -eq 1 ] && record "Contactor ON   line 9 = 1" "PASS" \
+               || record "Contactor ON   line 9 = $v  [expected 1]" "FAIL"
+
+
+# ──────────────────────────────────────────────────────────────────────────────
+step "7. E-Stop  (line 10)"
+# ──────────────────────────────────────────────────────────────────────────────
+
+warn "You will now be asked to press then release the E-Stop."
+pause
+
+info "Trigger the E-Stop now."
+pause
+v=$(read_di 10)
+[ "$v" -eq 0 ] && record "E-Stop triggered  line 10 = 0" "PASS" \
+               || record "E-Stop triggered  line 10 = $v  [expected 0]" "FAIL"
+
+info "Release the E-Stop now."
+pause
+v=$(read_di 10)
+[ "$v" -eq 1 ] && record "E-Stop released   line 10 = 1" "PASS" \
+               || record "E-Stop released   line 10 = $v  [expected 1]" "FAIL"
+
+# ──────────────────────────────────────────────────────────────────────────────
+step "8. ASB Output Tests  (lines 1, 2, 3)"
+# ──────────────────────────────────────────────────────────────────────────────
+
+# error_trigger  (line 1, active-high)
+info "Pulsing error_trigger for 200 ms (line 1 = 1 → 0)..."
+warn "ASB should register a brief trigger without latching a permanent fault."
+set_do 1 1; sleep 0.2; set_do 1 0
+if ask "Did ASB register a brief trigger with no lasting fault?"; then
+    record "ASB error_trigger pulse (line 1)" "PASS"
+else
+    record "ASB error_trigger pulse (line 1)" "FAIL"
+fi
+
+# recovery  (line 2, active-low)
+info "Enabling ASB recovery (line 2 = 0)..."
+set_do 2 0; sleep 0.5
+if ask "Did ASB enter recovery mode?"; then
+    record "ASB recovery ON  (line 2 = 0)" "PASS"
+else
+    record "ASB recovery ON  (line 2 = 0)" "FAIL"
+fi
+info "Disabling ASB recovery (line 2 = 1)..."
+set_do 2 1
+record "ASB recovery OFF (line 2 = 1)" "PASS"
+
+# ──────────────────────────────────────────────────────────────────────────────
+step "9. Safe-State Restore"
+# ──────────────────────────────────────────────────────────────────────────────
+
+safe_state
+record "Final safe-state restore" "PASS"
+
+# ──────────────────────────────────────────────────────────────────────────────
+step "SUMMARY"
+# ──────────────────────────────────────────────────────────────────────────────
+
+echo ""
+for entry in "${RESULTS[@]}"; do
+    name="${entry%%|*}"; result="${entry##*|}"
+    case "$result" in
+        PASS) echo -e "  ${GRN}[PASS]${RST}  $name" ;;
+        SKIP) echo -e "  ${YEL}[SKIP]${RST}  $name" ;;
+        *)    echo -e "  ${RED}[FAIL]${RST}  $name" ;;
+    esac
+done
+
+total=$(( PASS_COUNT + FAIL_COUNT + SKIP_COUNT ))
+echo ""
+echo -e "${BLD}━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━${RST}"
+echo -e "${BLD}Total: $total  |  ${GRN}PASS: $PASS_COUNT${RST}${BLD}  |  ${RED}FAIL: $FAIL_COUNT${RST}${BLD}  |  ${YEL}SKIP: $SKIP_COUNT${RST}"
+
+if [ "$FAIL_COUNT" -eq 0 ]; then
+    echo -e "${GRN}${BLD}PREFLIGHT PASSED — Board is ready for operation.${RST}"
+    exit 0
+else
+    echo -e "${RED}${BLD}PREFLIGHT FAILED — Resolve all failures before operating.${RST}"
+    exit 1
+fi
