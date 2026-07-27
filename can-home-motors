@@ -39,6 +39,12 @@ INVERT_DIR_EXPECTED       = {1: 1, 2: 0, 3: 0, 4: 0, 5: 0, 6: 0}
 # 0x6410:13 Invert_Dir_Motor — every node inverted.
 INVERT_DIR_MOTOR_EXPECTED = {1: 1, 2: 1, 3: 1, 4: 1, 5: 1, 6: 1}
 
+# 0x6099:03 — homing parameter; must be 2 on the three steer nodes.
+STEER_NODES          = (2, 4, 6)
+HOMING_6099_INDEX    = 0x6099
+HOMING_6099_SUB      = 0x03
+HOMING_6099_EXPECTED = 2
+
 home_values = {}
 stop_event  = threading.Event()
 
@@ -228,26 +234,33 @@ def wait_for_fault_clear(bus, node_id, name, timeout=120):
         time.sleep(0.5)
 
 
-# ── Pre-flight direction check ───────────────────────────────────────────────────
+# ── Pre-flight OD check ──────────────────────────────────────────────────────────
+
+def _sdo_response_size(response):
+    """Infer the OD entry size in bytes from an expedited SDO upload response byte."""
+    return {0x4F: 1, 0x4B: 2, 0x47: 3, 0x43: 4}.get(response.data[0], 4)
+
 
 def _verify_and_fix_od(bus, node_id, index, subindex, expected):
     """
-    Read one direction OD on a node, compare to expected. If it differs, write the
-    correct value and read it back to confirm the RAM value took.
+    Read one OD on a node, compare to expected. If it differs, write the correct value
+    (using the byte-width reported by the read) and read it back to confirm it took.
     Returns (status, changed): status is 'pass' | 'fixed' | 'fail'.
     """
     tag = f"[node {node_id}] 0x{index:04X}:{subindex:02X}"
-    current = decode_response(send_read_telegram(bus, node_id, index, subindex))
-    if current is None:
+    resp = send_read_telegram(bus, node_id, index, subindex)
+    if resp is None:
         print(f"  {tag}  NO RESPONSE — cannot verify")
         return "fail", False
+    current    = decode_response(resp)
+    size_bytes = _sdo_response_size(resp)
 
     if current == expected:
         print(f"  {tag}  = {current}  PASS")
         return "pass", False
 
     print(f"  {tag}  = {current}, expected {expected} — FIXING")
-    send_write_telegram(bus, node_id, index, subindex, expected, 1)
+    send_write_telegram(bus, node_id, index, subindex, expected, size_bytes)
     readback = decode_response(send_read_telegram(bus, node_id, index, subindex))
     if readback != expected:
         print(f"  {tag}  write failed (read back {readback}) — FAIL")
@@ -256,17 +269,19 @@ def _verify_and_fix_od(bus, node_id, index, subindex, expected):
     return "fixed", True
 
 
-def preflight_direction_check(interface, bustype):
+def preflight_od_check(interface, bustype):
     """
-    Verify (and auto-fix + save) the direction ODs on all six drive nodes before homing:
-    0x607E:00 (Invert_Dir) and 0x6410:13 (Invert_Dir_Motor).
+    Verify (and auto-fix + save) the pre-flight ODs before homing:
+      - 0x607E:00 (Invert_Dir)       on all six nodes
+      - 0x6410:13 (Invert_Dir_Motor) on all six nodes
+      - 0x6099:03                    == 2 on the steer nodes (2, 4, 6)
 
     Returns True only if every node was already correct (homing may proceed).
     Returns False if any node was unreachable/unwritable, or if any value had to be
-    corrected — a corrected node needs a full power-cycle for the new direction to take
+    corrected — a corrected node needs a full power-cycle for the change to take
     physical effect, so we save to EEPROM and ask the operator to power-cycle and re-run.
     """
-    print("===== Pre-flight: direction OD check (nodes 1-6) =====")
+    print("===== Pre-flight: OD check (dir nodes 1-6, 0x6099:03 steer nodes) =====")
     nodes = sorted(set(INVERT_DIR_EXPECTED) | set(INVERT_DIR_MOTOR_EXPECTED))
     any_fail = False
     changed_nodes = set()
@@ -282,6 +297,15 @@ def preflight_direction_check(interface, bustype):
             if c1 or c2:
                 changed_nodes.add(node_id)
 
+        # 0x6099:03 must be 2 on the steer nodes.
+        for node_id in STEER_NODES:
+            s3, c3 = _verify_and_fix_od(bus, node_id, HOMING_6099_INDEX, HOMING_6099_SUB,
+                                        HOMING_6099_EXPECTED)
+            if s3 == "fail":
+                any_fail = True
+            if c3:
+                changed_nodes.add(node_id)
+
         # Persist every node we corrected: CANopen store = ASCII "save" to 0x1010:01.
         for node_id in sorted(changed_nodes):
             print(f"  [node {node_id}] Saving corrected direction config to EEPROM...")
@@ -291,14 +315,14 @@ def preflight_direction_check(interface, bustype):
 
     print("===== Direction OD check complete =====")
     if any_fail:
-        print("Direction check FAILED — one or more nodes could not be verified/written.")
+        print("Pre-flight OD check FAILED — one or more nodes could not be verified/written.")
         print("Fix wiring/power, or pass --skip-dir-check, then re-run. Aborting.")
         return False
     if changed_nodes:
-        print(f"Direction ODs were corrected and saved on nodes {sorted(changed_nodes)}.")
-        print("Power-cycle those drivers so the new direction takes effect, then re-run homing.")
+        print(f"Pre-flight ODs were corrected and saved on nodes {sorted(changed_nodes)}.")
+        print("Power-cycle those drivers so the changes take effect, then re-run homing.")
         return False
-    print("All direction ODs already correct — proceeding to homing.\n")
+    print("All pre-flight ODs already correct — proceeding to homing.\n")
     return True
 
 
@@ -398,11 +422,11 @@ def main():
     print(f"Interface : {args.interface}  ({args.bustype})")
     print(f"Motors    : {list(motors_to_run.keys())}\n")
 
-    # Pre-flight gate: every driver must have the correct direction ODs before we
+    # Pre-flight gate: every driver must have the correct config ODs before we
     # move anything. A corrected node needs a power-cycle, so the gate aborts here.
     if args.skip_dir_check:
-        print("Skipping direction OD pre-flight check (--skip-dir-check).\n")
-    elif not preflight_direction_check(args.interface, args.bustype):
+        print("Skipping pre-flight OD check (--skip-dir-check).\n")
+    elif not preflight_od_check(args.interface, args.bustype):
         sys.exit(1)
 
     threads = []
