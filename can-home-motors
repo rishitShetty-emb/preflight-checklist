@@ -25,6 +25,7 @@ PROFILE_SPEED   = 200
 PROFILE_SPEED_ENC = 17500 * PROFILE_SPEED   # encoder units per RPM
 TAR_POS_CW      =  20000000
 TAR_POS_CCW     = -20000000
+LIMIT_SETTLE_SEC = 5   # settle time at a hard limit before capturing a/b
 
 # === DIRECTION OD PRE-FLIGHT (all six drive nodes) ===
 # Verified/auto-corrected before homing so every driver moves in an aligned frame.
@@ -346,6 +347,8 @@ def home_motor(name, node_id, interface, bustype):
             wait_for_fault_clear(bus, node_id, name)
             if stop_event.is_set():
                 return
+            print(f"[{name}] Settling {LIMIT_SETTLE_SEC}s at CW limit before reading position...")
+            time.sleep(LIMIT_SETTLE_SEC)
             a = get_actual_position(bus, node_id)
             print(f"[{name}] CW position (a): {a}")
 
@@ -358,6 +361,8 @@ def home_motor(name, node_id, interface, bustype):
             wait_for_fault_clear(bus, node_id, name)
             if stop_event.is_set():
                 return
+            print(f"[{name}] Settling {LIMIT_SETTLE_SEC}s at CCW limit before reading position...")
+            time.sleep(LIMIT_SETTLE_SEC)
             b = get_actual_position(bus, node_id)
             print(f"[{name}] CCW position (b): {b}")
 
