@@ -26,6 +26,19 @@ PROFILE_SPEED_ENC = 17500 * PROFILE_SPEED   # encoder units per RPM
 TAR_POS_CW      =  20000000
 TAR_POS_CCW     = -20000000
 
+# === DIRECTION OD PRE-FLIGHT (all six drive nodes) ===
+# Verified/auto-corrected before homing so every driver moves in an aligned frame.
+INVERT_DIR_INDEX       = 0x607E   # sub 0x00 — logical positive direction
+INVERT_DIR_SUB         = 0x00
+INVERT_DIR_MOTOR_INDEX = 0x6410   # sub 0x13 — motor-level direction inversion
+INVERT_DIR_MOTOR_SUB   = 0x13
+
+# 0x607E:00 Invert_Dir — 1 = CW positive, 0 = CCW positive.
+# Only node 1 has its logical positive direction reversed.
+INVERT_DIR_EXPECTED       = {1: 1, 2: 0, 3: 0, 4: 0, 5: 0, 6: 0}
+# 0x6410:13 Invert_Dir_Motor — every node inverted.
+INVERT_DIR_MOTOR_EXPECTED = {1: 1, 2: 1, 3: 1, 4: 1, 5: 1, 6: 1}
+
 home_values = {}
 stop_event  = threading.Event()
 
@@ -215,6 +228,80 @@ def wait_for_fault_clear(bus, node_id, name, timeout=120):
         time.sleep(0.5)
 
 
+# ── Pre-flight direction check ───────────────────────────────────────────────────
+
+def _verify_and_fix_od(bus, node_id, index, subindex, expected):
+    """
+    Read one direction OD on a node, compare to expected. If it differs, write the
+    correct value and read it back to confirm the RAM value took.
+    Returns (status, changed): status is 'pass' | 'fixed' | 'fail'.
+    """
+    tag = f"[node {node_id}] 0x{index:04X}:{subindex:02X}"
+    current = decode_response(send_read_telegram(bus, node_id, index, subindex))
+    if current is None:
+        print(f"  {tag}  NO RESPONSE — cannot verify")
+        return "fail", False
+
+    if current == expected:
+        print(f"  {tag}  = {current}  PASS")
+        return "pass", False
+
+    print(f"  {tag}  = {current}, expected {expected} — FIXING")
+    send_write_telegram(bus, node_id, index, subindex, expected, 1)
+    readback = decode_response(send_read_telegram(bus, node_id, index, subindex))
+    if readback != expected:
+        print(f"  {tag}  write failed (read back {readback}) — FAIL")
+        return "fail", True
+    print(f"  {tag}  corrected to {expected}")
+    return "fixed", True
+
+
+def preflight_direction_check(interface, bustype):
+    """
+    Verify (and auto-fix + save) the direction ODs on all six drive nodes before homing:
+    0x607E:00 (Invert_Dir) and 0x6410:13 (Invert_Dir_Motor).
+
+    Returns True only if every node was already correct (homing may proceed).
+    Returns False if any node was unreachable/unwritable, or if any value had to be
+    corrected — a corrected node needs a full power-cycle for the new direction to take
+    physical effect, so we save to EEPROM and ask the operator to power-cycle and re-run.
+    """
+    print("===== Pre-flight: direction OD check (nodes 1-6) =====")
+    nodes = sorted(set(INVERT_DIR_EXPECTED) | set(INVERT_DIR_MOTOR_EXPECTED))
+    any_fail = False
+    changed_nodes = set()
+
+    with can.interface.Bus(interface=bustype, channel=interface) as bus:
+        for node_id in nodes:
+            s1, c1 = _verify_and_fix_od(bus, node_id, INVERT_DIR_INDEX, INVERT_DIR_SUB,
+                                        INVERT_DIR_EXPECTED[node_id])
+            s2, c2 = _verify_and_fix_od(bus, node_id, INVERT_DIR_MOTOR_INDEX, INVERT_DIR_MOTOR_SUB,
+                                        INVERT_DIR_MOTOR_EXPECTED[node_id])
+            if "fail" in (s1, s2):
+                any_fail = True
+            if c1 or c2:
+                changed_nodes.add(node_id)
+
+        # Persist every node we corrected: CANopen store = ASCII "save" to 0x1010:01.
+        for node_id in sorted(changed_nodes):
+            print(f"  [node {node_id}] Saving corrected direction config to EEPROM...")
+            send_write_telegram(bus, node_id, 0x1010, 0x01, 0x65766173, 4)
+            time.sleep(1.5)   # drives need time to write flash/EEPROM
+            print(f"  [node {node_id}] Saved.")
+
+    print("===== Direction OD check complete =====")
+    if any_fail:
+        print("Direction check FAILED — one or more nodes could not be verified/written.")
+        print("Fix wiring/power, or pass --skip-dir-check, then re-run. Aborting.")
+        return False
+    if changed_nodes:
+        print(f"Direction ODs were corrected and saved on nodes {sorted(changed_nodes)}.")
+        print("Power-cycle those drivers so the new direction takes effect, then re-run homing.")
+        return False
+    print("All direction ODs already correct — proceeding to homing.\n")
+    return True
+
+
 # ── Homing sequence ────────────────────────────────────────────────────────────
 
 def home_motor(name, node_id, interface, bustype):
@@ -296,6 +383,8 @@ def main():
     parser.add_argument("--motors",    "-m", nargs="*",
                         help="Subset of motors to home (e.g. Front Left). "
                              "Defaults to all configured motors.")
+    parser.add_argument("--skip-dir-check", action="store_true",
+                        help="Skip the pre-flight direction OD check on nodes 1-6.")
     args = parser.parse_args()
 
     motors_to_run = {
@@ -308,6 +397,13 @@ def main():
 
     print(f"Interface : {args.interface}  ({args.bustype})")
     print(f"Motors    : {list(motors_to_run.keys())}\n")
+
+    # Pre-flight gate: every driver must have the correct direction ODs before we
+    # move anything. A corrected node needs a power-cycle, so the gate aborts here.
+    if args.skip_dir_check:
+        print("Skipping direction OD pre-flight check (--skip-dir-check).\n")
+    elif not preflight_direction_check(args.interface, args.bustype):
+        sys.exit(1)
 
     threads = []
     try:
