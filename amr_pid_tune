@@ -14,7 +14,7 @@ travel motors.
   3     Kvi_Sum_Limit   0x60F9:0C    Velocity integrator anti-windup cap
   4     Speed_Fb_N      0x60F9:05    Velocity feedback filter coefficient
   5     Kpp             0x60FB:01    Position proportional gain
-  6     Kvff            0x2FF0:1A    Velocity feed-forward
+  6     Kvff            0x60FB:02    Velocity feed-forward (K_Velocity_FF)
 
 Design constraints (enforced as reminders):
   - Filter BW  ≥  2 × Velocity loop BW   (avoids oscillation)
@@ -80,10 +80,10 @@ _PARAMS = [
         '      velocity resonance and produce oscillation.',
     ),
     (
-        'Kvff', 0x2FF0, 0x1A,
-        'Velocity feed-forward (Kvff)',
-        'Reduces following error during motion. Typical starting value: 1000 (100% FF).\n'
-        '      Too high causes overshoot on accelerations.',
+        'Kvff', 0x60FB, 0x02,
+        'Velocity feed-forward (Kvff / K_Velocity_FF)',
+        'Reduces following error during motion. 0 = no feed-forward, 1000 = 100% FF.\n'
+        '      Typical starting value: 1000 (100% FF). Too high causes overshoot on accelerations.',
     ),
 ]
 
