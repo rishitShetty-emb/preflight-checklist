@@ -1,57 +1,85 @@
 #!/usr/bin/env python3
 """
-CANopen Motor Auto-Homing Script
-Homes multiple servo motors over CAN bus using CANopen SDO protocol.
-Each motor runs in its own thread; all share the same CAN interface.
+CANopen Steer-Motor Auto-Homing Script
+--------------------------------------
+Homes the three AMR steer motors (Front=node 2, Left=node 4, Right=node 6) over CAN
+bus using CANopen SDO. Run standalone, BEFORE the ros2_canopen stack starts.
+
+Three homing options (interactive menu, or --mode flag):
+
+  1) Full homing    Sweep both hard limits, drive to midpoint (a+b)/2, then home.
+  2) Assisted align Per node: confirm alignment or jog by +/- counts, then home.
+  3) Blind homing   Home at the current position (no sweep, no jog).
+
+All options run the same core homing state machine on each node:
+  mode 6 (Homing) -> CW 0x06 -> encoder reset (0x2690=10) -> CW 0x0F -> CW 0x1F -> save.
+
+See docs/specs/2026-08-05-can-home-motors-redesign-design.md.
 """
 
-import can
-import time
-import threading
-import sys
 import argparse
+import sys
+import threading
+import time
+
+import can
 
 # === CONFIGURATION ===
-# Map motor name -> CANopen Node ID
+# Map motor name -> CANopen Node ID (steer motors only).
 MOTORS = {
     "Front": 2,
     "Left":  4,
     "Right": 6,
 }
 
-CAN_INTERFACE   = "can0"
-CAN_BUSTYPE     = "socketcan"
-PROFILE_SPEED   = 200
+CAN_INTERFACE     = "can0"
+CAN_BUSTYPE       = "socketcan"
+PROFILE_SPEED     = 200
 PROFILE_SPEED_ENC = 17500 * PROFILE_SPEED   # encoder units per RPM
-TAR_POS_CW      =  20000000
-TAR_POS_CCW     = -20000000
-LIMIT_SETTLE_SEC = 120   # settle time at a hard limit before capturing a/b
+TAR_POS_CW        =  20000000               # far target: drive through to the CW hard stop
+TAR_POS_CCW       = -20000000               # far target: drive through to the CCW hard stop
+LIMIT_STABILIZE_SEC = 1.0                   # brief settle at a hard limit before reading pos
+JOG_STEP           = 10000                  # default +/- jog increment (encoder counts)
 
-# === DIRECTION OD PRE-FLIGHT (all six drive nodes) ===
+# === DIRECTION / HOMING OD PRE-FLIGHT ===
 # Verified/auto-corrected before homing so every driver moves in an aligned frame.
 INVERT_DIR_INDEX       = 0x607E   # sub 0x00 — logical positive direction
 INVERT_DIR_SUB         = 0x00
 INVERT_DIR_MOTOR_INDEX = 0x6410   # sub 0x13 — motor-level direction inversion
 INVERT_DIR_MOTOR_SUB   = 0x13
 
-# 0x607E:00 Invert_Dir — 1 = CW positive, 0 = CCW positive.
-# Only node 1 has its logical positive direction reversed.
+# 0x607E:00 Invert_Dir — 1 = CW positive, 0 = CCW positive. Only node 1 is reversed.
 INVERT_DIR_EXPECTED       = {1: 1, 2: 0, 3: 0, 4: 0, 5: 0, 6: 0}
 # 0x6410:13 Invert_Dir_Motor — every node inverted.
 INVERT_DIR_MOTOR_EXPECTED = {1: 1, 2: 1, 3: 1, 4: 1, 5: 1, 6: 1}
 
-# 0x6099:03 — homing parameter; must be 2 on the three steer nodes.
-STEER_NODES          = (2, 4, 6)
-HOMING_6099_INDEX    = 0x6099
-HOMING_6099_SUB      = 0x03
-HOMING_6099_EXPECTED = 2
+STEER_NODES = (2, 4, 6)
+
+# 0x6099:03 Homing_Power_On — must be 2 on the steer nodes.
+HOMING_6099_POWERON_INDEX    = 0x6099
+HOMING_6099_POWERON_SUB      = 0x03
+HOMING_6099_POWERON_EXPECTED = 2
+
+# 0x6099:05 Home_Offset_Mode — must be 1 on the steer nodes.
+HOMING_6099_OFFMODE_INDEX    = 0x6099
+HOMING_6099_OFFMODE_SUB      = 0x05
+HOMING_6099_OFFMODE_EXPECTED = 1
+
+# CiA-402 operation modes
+MODE_PROFILE_POSITION = 1
+MODE_HOMING           = 6
+
+# Statusword bits
+SW_OP_ENABLED    = 0x0004   # bit 2
+SW_FAULT         = 0x0008   # bit 3
+SW_FOLLOW_ERROR  = 0x2000   # bit 13
 
 home_values = {}
 stop_event  = threading.Event()
 
 # CANopen SDO COB-IDs
-SDO_TX_BASE = 0x600   # client → server  (our request)
-SDO_RX_BASE = 0x580   # server → client  (drive response)
+SDO_TX_BASE = 0x600   # client → server (our request)
+SDO_RX_BASE = 0x580   # server → client (drive response)
 
 SDO_READ_RESPONSES = (0x43, 0x4B, 0x4F)   # 4-byte / 2-byte / 1-byte upload responses
 
@@ -117,13 +145,29 @@ def decode_response(response, signed=False):
     return int.from_bytes(response.data[4:8], byteorder='little', signed=signed)
 
 
-# ── Drive control ──────────────────────────────────────────────────────────────
+# ── Drive telemetry ──────────────────────────────────────────────────────────────
 
-def encoder_data_reset(bus, node_id, index, subindex, value):
-    send_write_telegram(bus, node_id, index, subindex, value, 1)
+def get_actual_position(bus, node_id):
+    return decode_response(send_read_telegram(bus, node_id, 0x6064, 0x00), signed=True)
+
+
+def get_error_code(bus, node_id):
+    return decode_response(send_read_telegram(bus, node_id, 0x603F, 0x00))
+
+
+def get_status_word(bus, node_id):
+    return decode_response(send_read_telegram(bus, node_id, 0x6041, 0x00))
+
+
+# ── Drive control primitives ───────────────────────────────────────────────────
+
+def encoder_data_reset(bus, node_id):
+    """Zero the encoder / multi-turn data at the current position (0x2690:00 = 10)."""
+    send_write_telegram(bus, node_id, 0x2690, 0x00, 10, 1)
 
 
 def clear_fault(bus, node_id):
+    """Fault-reset rising edge on controlword bit 7, then back to Shutdown."""
     send_write_telegram(bus, node_id, 0x6040, 0x00, 0x80, 2)
     time.sleep(0.2)
     send_write_telegram(bus, node_id, 0x6040, 0x00, 0x06, 2)
@@ -141,98 +185,288 @@ def reboot_driver(bus, node_id):
     time.sleep(1)
 
 
-def get_actual_position(bus, node_id):
-    return decode_response(send_read_telegram(bus, node_id, 0x6064, 0x00), signed=True)
-
-def get_error_code(bus, node_id):
-    return decode_response(send_read_telegram(bus, node_id, 0x603F, 0x00))
-
-def get_status_word(bus, node_id):
-    return decode_response(send_read_telegram(bus, node_id, 0x6041, 0x00))
-
-
-def enable_and_save(bus, node_id, name):
-    """After homing: set mode 6, enable drive via standard CW sequence, save params to NVM."""
-    print(f"[{name}] Setting operation mode 6 (Homing mode)...")
-    send_write_telegram(bus, node_id, 0x6060, 0x00, 6, 1)
-    time.sleep(0.2)
-
-    print(f"[{name}] Enabling drive: CW 0x06 -> 0x0F -> 0x1F...")
-    send_write_telegram(bus, node_id, 0x6040, 0x00, 0x06, 2)
-    time.sleep(0.2)
-    send_write_telegram(bus, node_id, 0x6040, 0x00, 0x0F, 2)
-    time.sleep(0.2)
-    send_write_telegram(bus, node_id, 0x6040, 0x00, 0x1F, 2)
-    time.sleep(0.2)
-
-    # CANopen standard store: write ASCII "save" (0x65766173) to 0x1010:01
-    print(f"[{name}] Saving control & motor parameters to NVM...")
-    send_write_telegram(bus, node_id, 0x1010, 0x01, 0x65766173, 4)
-    time.sleep(1.5)   # drives need time to write flash/EEPROM
-    print(f"[{name}] Parameters saved.")
-
-
 def move_to_target(bus, node_id, pos):
-    send_write_telegram(bus, node_id, 0x6060, 0x00, 1, 1)                    # Profile Position mode
-    send_write_telegram(bus, node_id, 0x6081, 0x00, PROFILE_SPEED_ENC, 4)    # Profile velocity
-    send_write_telegram(bus, node_id, 0x607A, 0x00, pos, 4)                  # Target position
-    send_write_telegram(bus, node_id, 0x6040, 0x00, 0x2F, 2)                 # Enable + new setpoint
-    send_write_telegram(bus, node_id, 0x6040, 0x00, 0x3F, 2)                 # Execute move
+    """Absolute move in Profile Position mode (mode 1) to an encoder position."""
+    send_write_telegram(bus, node_id, 0x6060, 0x00, MODE_PROFILE_POSITION, 1)  # Profile Position
+    send_write_telegram(bus, node_id, 0x6081, 0x00, PROFILE_SPEED_ENC, 4)      # Profile velocity
+    send_write_telegram(bus, node_id, 0x607A, 0x00, pos, 4)                    # Target position
+    send_write_telegram(bus, node_id, 0x6040, 0x00, 0x2F, 2)                   # Enable + new setpoint
+    send_write_telegram(bus, node_id, 0x6040, 0x00, 0x3F, 2)                   # Execute move
 
 
-# ── Wait helpers ───────────────────────────────────────────────────────────────
-
-def wait_for_following_error(bus, node_id, name, timeout=300):
+def ensure_clean_enabled(bus, node_id, name, timeout=10):
     """
-    Wait until the drive signals a limit was hit (following error / error code),
-    OR the drive drops out of Operation Enabled (target reached without hitting a stop).
-    Returns 'following_error' or 'target_reached'.
+    Guarantee the drive starts from a clean, fault-free, ENABLED state BEFORE any sweep/jog.
+
+    Fixes the startup bug: if the drive was already faulted when the script started, a stale
+    fault / following-error bit would otherwise be read by the sweep as "hit the hard stop"
+    without the axis ever moving. We clear the fault and confirm error code 0 + fault bit
+    clear first, then enable.
+
+    Returns True once the drive is enabled and clean, False on timeout.
     """
+    print(f"[{name}] Ensuring clean enabled state...")
+    reboot_driver(bus, node_id)
+    clear_fault(bus, node_id)
+
     deadline = time.time() + timeout
-    was_op_enabled = False
     while not stop_event.is_set():
         err = get_error_code(bus, node_id)
         sw  = get_status_word(bus, node_id)
-
         if err is not None and sw is not None:
-            op_enabled      = bool(sw & 0x0004)   # bit 2
-            following_error = bool(sw & 0x2000)   # bit 13
-            print(f"  [{name}] StatusWord=0x{sw & 0xFFFF:04X}  ErrorCode=0x{err:04X}")
+            faulted = bool(sw & SW_FAULT)
+            if err == 0 and not faulted:
+                break
+            # still dirty — re-issue a fault reset edge
+            clear_fault(bus, node_id)
+        if time.time() > deadline:
+            print(f"[{name}] WARN: could not reach a clean state "
+                  f"(err={err} sw=0x{(sw or 0) & 0xFFFF:04X}) — aborting node")
+            return False
+        time.sleep(0.3)
 
-            if op_enabled:
+    # Enable: Shutdown -> Switch On -> Enable Operation
+    send_write_telegram(bus, node_id, 0x6040, 0x00, 0x06, 2)
+    time.sleep(0.2)
+    send_write_telegram(bus, node_id, 0x6040, 0x00, 0x07, 2)
+    time.sleep(0.2)
+    send_write_telegram(bus, node_id, 0x6040, 0x00, 0x0F, 2)
+    time.sleep(0.2)
+
+    sw = get_status_word(bus, node_id)
+    if sw is not None and (sw & SW_OP_ENABLED):
+        print(f"[{name}] Clean & enabled (SW=0x{sw & 0xFFFF:04X})")
+        return True
+    print(f"[{name}] WARN: not Operation-Enabled after enable (SW=0x{(sw or 0) & 0xFFFF:04X})")
+    return False
+
+
+# ── Core homing state machine (shared by all options) ──────────────────────────
+
+def run_home_state_machine(bus, node_id, name):
+    """
+    Zero the encoder at the CURRENT position and persist it.
+
+      1. 0x6060 = 6      Operation mode = Homing
+      2. 0x6040 = 0x06   Controlword: ready (NOT enabled yet)
+      3. 0x2690 = 10     Encoder data reset (zero here)
+      4. 0x6040 = 0x0F   Controlword: enable operation
+      5. 0x6040 = 0x1F   Controlword: execute homing
+      6. 0x1010:01 = "save"  Persist to NVM
+    """
+    print(f"[{name}] Homing state machine: mode 6 -> 0x06 -> enc reset -> 0x0F -> 0x1F -> save")
+    send_write_telegram(bus, node_id, 0x6060, 0x00, MODE_HOMING, 1)   # Homing mode
+    time.sleep(0.2)
+    send_write_telegram(bus, node_id, 0x6040, 0x00, 0x06, 2)          # ready, not enabled
+    time.sleep(0.2)
+    encoder_data_reset(bus, node_id)                                  # 0x2690 = 10
+    time.sleep(0.5)
+    send_write_telegram(bus, node_id, 0x6040, 0x00, 0x0F, 2)          # enable
+    time.sleep(0.2)
+    send_write_telegram(bus, node_id, 0x6040, 0x00, 0x1F, 2)          # execute homing
+    time.sleep(0.5)
+
+    # Persist: CANopen store = ASCII "save" (0x65766173) to 0x1010:01.
+    print(f"[{name}] Saving parameters to NVM...")
+    send_write_telegram(bus, node_id, 0x1010, 0x01, 0x65766173, 4)
+    time.sleep(1.5)
+
+    home_val = get_actual_position(bus, node_id)
+    home_values[name] = home_val
+    print(f"[{name}] Home set. Actual position now: {home_val}")
+
+
+# ── Sweep / limit detection ──────────────────────────────────────────────────────
+
+def wait_for_hard_limit(bus, node_id, name, timeout=300):
+    """
+    Drive is already commanded toward a hard stop. Wait until the drive signals a limit
+    (following error / error code) AFTER it has genuinely started moving.
+
+    The "started moving" guard is the second half of the startup-bug fix: a following-error
+    seen before the axis is op-enabled and has actually moved is treated as stale, not a hit.
+
+    Returns 'limit' (hit a stop), 'target_reached' (moved but no stop), or 'timeout'.
+    """
+    deadline = time.time() + timeout
+    start_pos = get_actual_position(bus, node_id)
+    moved = False
+    was_op_enabled = False
+
+    while not stop_event.is_set():
+        err = get_error_code(bus, node_id)
+        sw  = get_status_word(bus, node_id)
+        pos = get_actual_position(bus, node_id)
+
+        if sw is not None:
+            if sw & SW_OP_ENABLED:
                 was_op_enabled = True
+            if (start_pos is not None and pos is not None
+                    and abs(pos - start_pos) > JOG_STEP):
+                moved = True
 
-            if (err != 0) or following_error:
-                print(f"  [{name}] Limit hit (following error): ErrCode=0x{err:04X} SW=0x{sw & 0xFFFF:04X}")
-                return "following_error"
+            follow = bool(sw & SW_FOLLOW_ERROR)
+            print(f"  [{name}] SW=0x{sw & 0xFFFF:04X} err=0x{(err or 0):04X} "
+                  f"pos={pos} moved={moved}")
 
-            # Drive left Operation Enabled after having been enabled → move completed without hitting a stop
-            if was_op_enabled and not op_enabled:
-                print(f"  [{name}] Drive stopped at software target (no physical stop found): SW=0x{sw & 0xFFFF:04X}")
+            # Only accept a stop once the axis has actually been enabled AND moved.
+            if was_op_enabled and moved and ((err not in (None, 0)) or follow):
+                print(f"  [{name}] Hard limit hit (err=0x{(err or 0):04X} SW=0x{sw & 0xFFFF:04X})")
+                return "limit"
+
+            # Enabled + moved, then dropped out of enable without a stop -> reached target.
+            if was_op_enabled and moved and not (sw & SW_OP_ENABLED):
+                print(f"  [{name}] Reached target without a hard stop (SW=0x{sw & 0xFFFF:04X})")
                 return "target_reached"
 
         if time.time() > deadline:
-            print(f"  [{name}] Timeout waiting after {timeout}s — continuing")
+            print(f"  [{name}] Timeout after {timeout}s waiting for limit")
             return "timeout"
-
         time.sleep(0.3)
+    return "timeout"
 
 
-def wait_for_fault_clear(bus, node_id, name, timeout=120):
-    deadline = time.time() + timeout
-    while not stop_event.is_set():
-        sw = get_status_word(bus, node_id)
-        if sw is not None:
-            fault_bit   = bool(sw & 0x0008)   # bit 3
-            follow_bit  = bool(sw & 0x2000)   # bit 13
-            print(f"  [{name}] Waiting fault clear — StatusWord=0x{sw & 0xFFFF:04X}")
-            if not fault_bit and not follow_bit:
-                print(f"  [{name}] Fault cleared (SW=0x{sw & 0xFFFF:04X}), proceeding")
-                return
-        if time.time() > deadline:
-            print(f"  [{name}] Timeout waiting for fault clear after {timeout}s — continuing")
-            return
+def sweep_to_limit(bus, node_id, name, target, label):
+    """Drive to a hard stop, stabilize briefly, return the captured position."""
+    print(f"[{name}] Sweeping to {label} limit...")
+    move_to_target(bus, node_id, target)
+    result = wait_for_hard_limit(bus, node_id, name)
+    if result != "limit":
+        print(f"[{name}] WARN: {label} sweep ended as '{result}', not a hard limit — "
+              f"captured position may be unreliable")
+    clear_fault(bus, node_id)
+    time.sleep(LIMIT_STABILIZE_SEC)
+    pos = get_actual_position(bus, node_id)
+    print(f"[{name}] {label} limit position: {pos}")
+    return pos
+
+
+# ── Jog REPL (Option 2) ──────────────────────────────────────────────────────────
+
+def jog_node(bus, node_id, name):
+    """
+    Interactive jog in Profile Position mode. Returns True if the operator finished
+    aligning (run the state machine), False if they skipped the node.
+
+    Commands: '+' = +JOG_STEP, '-' = -JOG_STEP, signed int = that many counts,
+              'd' = done (align complete), 's' = skip node.
+    """
+    print(f"\n[{name}] Jog to align. Commands: + (+{JOG_STEP}), - (-{JOG_STEP}), "
+          f"<signed int> = counts, d = done, s = skip")
+    while True:
+        pos = get_actual_position(bus, node_id)
+        cmd = input(f"[{name}] pos={pos} > ").strip()
+        if cmd == "d":
+            return True
+        if cmd == "s":
+            print(f"[{name}] Skipped.")
+            return False
+        if cmd == "+":
+            delta = JOG_STEP
+        elif cmd == "-":
+            delta = -JOG_STEP
+        else:
+            try:
+                delta = int(cmd)
+            except ValueError:
+                print("  ? use +, -, a signed integer, d, or s")
+                continue
+        if pos is None:
+            print("  cannot read position — retry")
+            continue
+        target = pos + delta
+        print(f"  moving {delta:+d} -> target {target}")
+        move_to_target(bus, node_id, target)
         time.sleep(0.5)
+
+
+# ── Option orchestrators ─────────────────────────────────────────────────────────
+
+def home_full_one(name, node_id, interface, bustype):
+    """Option 1 per-node worker: sweep both limits, go to midpoint, then home."""
+    try:
+        with can.interface.Bus(interface=bustype, channel=interface) as bus:
+            print(f"[{name}] Full homing on {interface}, node {node_id}")
+            if not ensure_clean_enabled(bus, node_id, name):
+                return
+            a = sweep_to_limit(bus, node_id, name, TAR_POS_CW, "CW")
+            if stop_event.is_set():
+                return
+            if not ensure_clean_enabled(bus, node_id, name):
+                return
+            b = sweep_to_limit(bus, node_id, name, TAR_POS_CCW, "CCW")
+            if stop_event.is_set():
+                return
+            if a is None or b is None:
+                print(f"[{name}] ERROR: could not read both limits (a={a} b={b}) — aborting")
+                return
+            mid = (a + b) // 2
+            print(f"[{name}] Midpoint (a+b)/2 = {mid}")
+            move_to_target(bus, node_id, mid)
+            # Wait until the midpoint is reached (no hard stop expected here).
+            while not stop_event.is_set():
+                pos = get_actual_position(bus, node_id)
+                if pos is not None and abs(pos - mid) <= JOG_STEP:
+                    print(f"[{name}] Reached midpoint: {pos}")
+                    break
+                time.sleep(0.5)
+            if stop_event.is_set():
+                return
+            run_home_state_machine(bus, node_id, name)
+    except Exception as exc:   # noqa: BLE001 — operator script, report and continue
+        print(f"[{name}] Error: {exc}")
+
+
+def home_blind_one(name, node_id, interface, bustype):
+    """Option 3 per-node worker: home at the current position."""
+    try:
+        with can.interface.Bus(interface=bustype, channel=interface) as bus:
+            print(f"[{name}] Blind homing on {interface}, node {node_id}")
+            if not ensure_clean_enabled(bus, node_id, name):
+                return
+            if stop_event.is_set():
+                return
+            run_home_state_machine(bus, node_id, name)
+    except Exception as exc:   # noqa: BLE001
+        print(f"[{name}] Error: {exc}")
+
+
+def run_parallel(worker, motors, interface, bustype):
+    """Run a per-node worker across all selected motors, one thread each."""
+    threads = []
+    for name, node_id in motors.items():
+        t = threading.Thread(target=worker, args=(name, node_id, interface, bustype),
+                             daemon=True)
+        threads.append(t)
+        t.start()
+    while any(t.is_alive() for t in threads):
+        time.sleep(0.5)
+
+
+def option_full(motors, interface, bustype):
+    run_parallel(home_full_one, motors, interface, bustype)
+
+
+def option_blind(motors, interface, bustype):
+    run_parallel(home_blind_one, motors, interface, bustype)
+
+
+def option_align(motors, interface, bustype):
+    """Option 2: sequential, node-by-node. Confirm alignment or jog, then home."""
+    with can.interface.Bus(interface=bustype, channel=interface) as bus:
+        for name, node_id in motors.items():
+            if stop_event.is_set():
+                return
+            print(f"\n===== {name} (node {node_id}) =====")
+            ans = input(f"Is {name} aligned? [y/n] ").strip().lower()
+            if ans == "y":
+                print(f"[{name}] Reported aligned — skipping.")
+                continue
+            if not ensure_clean_enabled(bus, node_id, name):
+                continue
+            if not jog_node(bus, node_id, name):
+                continue   # operator skipped
+            run_home_state_machine(bus, node_id, name)
 
 
 # ── Pre-flight OD check ──────────────────────────────────────────────────────────
@@ -244,8 +478,7 @@ def _sdo_response_size(response):
 
 def _verify_and_fix_od(bus, node_id, index, subindex, expected):
     """
-    Read one OD on a node, compare to expected. If it differs, write the correct value
-    (using the byte-width reported by the read) and read it back to confirm it took.
+    Read one OD, compare to expected. If it differs, write the correct value and read back.
     Returns (status, changed): status is 'pass' | 'fixed' | 'fail'.
     """
     tag = f"[node {node_id}] 0x{index:04X}:{subindex:02X}"
@@ -273,16 +506,17 @@ def _verify_and_fix_od(bus, node_id, index, subindex, expected):
 def preflight_od_check(interface, bustype):
     """
     Verify (and auto-fix + save) the pre-flight ODs before homing:
-      - 0x607E:00 (Invert_Dir)       on all six nodes
-      - 0x6410:13 (Invert_Dir_Motor) on all six nodes
-      - 0x6099:03                    == 2 on the steer nodes (2, 4, 6)
+      - 0x607E:00 (Invert_Dir)        on all six nodes
+      - 0x6410:13 (Invert_Dir_Motor)  on all six nodes
+      - 0x6099:03 (Homing_Power_On)   == 2 on the steer nodes
+      - 0x6099:05 (Home_Offset_Mode)  == 1 on the steer nodes
 
-    Returns True only if every node was already correct (homing may proceed).
-    Returns False if any node was unreachable/unwritable, or if any value had to be
-    corrected — a corrected node needs a full power-cycle for the change to take
-    physical effect, so we save to EEPROM and ask the operator to power-cycle and re-run.
+    Returns True only if every node was already correct (homing may proceed). Returns False
+    if any node was unreachable/unwritable OR any value had to be corrected — a corrected
+    node needs a power-cycle for the change to take effect, so we save to EEPROM and ask the
+    operator to power-cycle and re-run.
     """
-    print("===== Pre-flight: OD check (dir nodes 1-6, 0x6099:03 steer nodes) =====")
+    print("===== Pre-flight: OD check (dir nodes 1-6; homing ODs on steer nodes) =====")
     nodes = sorted(set(INVERT_DIR_EXPECTED) | set(INVERT_DIR_MOTOR_EXPECTED))
     any_fail = False
     changed_nodes = set()
@@ -298,23 +532,25 @@ def preflight_od_check(interface, bustype):
             if c1 or c2:
                 changed_nodes.add(node_id)
 
-        # 0x6099:03 must be 2 on the steer nodes.
+        # Homing ODs on the steer nodes: 0x6099:03 == 2 and 0x6099:05 == 1.
         for node_id in STEER_NODES:
-            s3, c3 = _verify_and_fix_od(bus, node_id, HOMING_6099_INDEX, HOMING_6099_SUB,
-                                        HOMING_6099_EXPECTED)
-            if s3 == "fail":
+            s3, c3 = _verify_and_fix_od(bus, node_id, HOMING_6099_POWERON_INDEX,
+                                        HOMING_6099_POWERON_SUB, HOMING_6099_POWERON_EXPECTED)
+            s4, c4 = _verify_and_fix_od(bus, node_id, HOMING_6099_OFFMODE_INDEX,
+                                        HOMING_6099_OFFMODE_SUB, HOMING_6099_OFFMODE_EXPECTED)
+            if "fail" in (s3, s4):
                 any_fail = True
-            if c3:
+            if c3 or c4:
                 changed_nodes.add(node_id)
 
         # Persist every node we corrected: CANopen store = ASCII "save" to 0x1010:01.
         for node_id in sorted(changed_nodes):
-            print(f"  [node {node_id}] Saving corrected direction config to EEPROM...")
+            print(f"  [node {node_id}] Saving corrected config to EEPROM...")
             send_write_telegram(bus, node_id, 0x1010, 0x01, 0x65766173, 4)
-            time.sleep(1.5)   # drives need time to write flash/EEPROM
+            time.sleep(1.5)
             print(f"  [node {node_id}] Saved.")
 
-    print("===== Direction OD check complete =====")
+    print("===== OD check complete =====")
     if any_fail:
         print("Pre-flight OD check FAILED — one or more nodes could not be verified/written.")
         print("Fix wiring/power, or pass --skip-dir-check, then re-run. Aborting.")
@@ -327,138 +563,96 @@ def preflight_od_check(interface, bustype):
     return True
 
 
-# ── Homing sequence ────────────────────────────────────────────────────────────
+# ── Menu / entry point ───────────────────────────────────────────────────────────
 
-def home_motor(name, node_id, interface, bustype):
-    """Full homing sequence for one motor.  Runs in its own thread with its own bus socket."""
-    try:
-        # Each thread gets its own socket so recv() is independent per node.
-        with can.interface.Bus(interface=bustype, channel=interface) as bus:
-            print(f"[{name}] Connected on {interface}, node ID {node_id}")
-            print(f"[{name}] Rebooting driver to clear previous errors...")
-            reboot_driver(bus, node_id)
+MODE_DISPATCH = {
+    "full":  option_full,
+    "align": option_align,
+    "blind": option_blind,
+}
 
-            # ── CW sweep ──
-            move_to_target(bus, node_id, TAR_POS_CW)
-            print(f"[{name}] Moving to CW limit...")
-            wait_for_following_error(bus, node_id, name)
-            clear_fault(bus, node_id)
-            print(f"[{name}] Fault cleared after CW")
-            wait_for_fault_clear(bus, node_id, name)
-            if stop_event.is_set():
-                return
-            print(f"[{name}] Settling {LIMIT_SETTLE_SEC}s at CW limit before reading position...")
-            time.sleep(LIMIT_SETTLE_SEC)
-            a = get_actual_position(bus, node_id)
-            print(f"[{name}] CW position (a): {a}")
-
-            # ── CCW sweep ──
-            move_to_target(bus, node_id, TAR_POS_CCW)
-            print(f"[{name}] Moving to CCW limit...")
-            wait_for_following_error(bus, node_id, name)
-            clear_fault(bus, node_id)
-            print(f"[{name}] Fault cleared after CCW")
-            wait_for_fault_clear(bus, node_id, name)
-            if stop_event.is_set():
-                return
-            print(f"[{name}] Settling {LIMIT_SETTLE_SEC}s at CCW limit before reading position...")
-            time.sleep(LIMIT_SETTLE_SEC)
-            b = get_actual_position(bus, node_id)
-            print(f"[{name}] CCW position (b): {b}")
-
-            # ── Midpoint ──
-            mid = (a + b) // 2
-            print(f"[{name}] Midpoint (a+b)/2: {mid}")
-            move_to_target(bus, node_id, mid)
-            while not stop_event.is_set():
-                pos = get_actual_position(bus, node_id)
-                if pos is not None and pos == mid:
-                    print(f"[{name}] Reached midpoint: {pos}")
-                    break
-                time.sleep(0.5)
-
-            if stop_event.is_set():
-                return
-
-            # ── Encoder reset ──
-            reboot_driver(bus, node_id)
-            print(f"[{name}] Rebooting & resetting encoder...")
-            encoder_data_reset(bus, node_id, 0x2690, 0x00, 10)
-            print(f"[{name}] Encoder reset done")
-            wait_for_fault_clear(bus, node_id, name)
-            if stop_event.is_set():
-                return
-
-            home_val = get_actual_position(bus, node_id)
-            home_values[name] = home_val
-            print(f"[{name}] Home value set to: {home_val}")
-            enable_and_save(bus, node_id, name)
-
-    except Exception as e:
-        print(f"[{name}] Error: {e}")
+MODE_MENU = [
+    ("1", "full",  "Full homing     (sweep both limits, go to midpoint, then home)"),
+    ("2", "align", "Assisted align  (per node: confirm/jog to alignment, then home)"),
+    ("3", "blind", "Blind homing    (home at current position, no sweep/jog)"),
+]
 
 
-# ── Entry point ────────────────────────────────────────────────────────────────
+def prompt_mode():
+    print("Select homing option:")
+    for num, _mode, desc in MODE_MENU:
+        print(f"  {num}) {desc}")
+    choice = input("> ").strip()
+    for num, mode, _desc in MODE_MENU:
+        if choice in (num, mode):
+            return mode
+    print(f"Invalid choice: {choice!r}")
+    return None
+
+
+def prompt_nodes():
+    names = input(f"Nodes [all] ({' '.join(MOTORS)}): ").strip()
+    if not names:
+        return dict(MOTORS)
+    chosen = {}
+    for token in names.split():
+        if token in MOTORS:
+            chosen[token] = MOTORS[token]
+        else:
+            print(f"  ignoring unknown motor: {token!r}")
+    return chosen
+
 
 def main():
     parser = argparse.ArgumentParser(
-        description="CANopen motor auto-homing over CAN bus",
+        description="CANopen steer-motor auto-homing (3 options).",
         formatter_class=argparse.ArgumentDefaultsHelpFormatter,
     )
-    parser.add_argument("--interface", "-i", default=CAN_INTERFACE,
-                        help="CAN interface name")
-    parser.add_argument("--bustype",   "-b", default=CAN_BUSTYPE,
-                        help="python-can bus type")
-    parser.add_argument("--motors",    "-m", nargs="*",
-                        help="Subset of motors to home (e.g. Front Left). "
-                             "Defaults to all configured motors.")
+    parser.add_argument("--interface", "-i", default=CAN_INTERFACE, help="CAN interface name")
+    parser.add_argument("--bustype", "-b", default=CAN_BUSTYPE, help="python-can bus type")
+    parser.add_argument("--mode", "-M", choices=list(MODE_DISPATCH),
+                        help="homing option (skips the menu)")
+    parser.add_argument("--motors", "-m", nargs="*",
+                        help="subset of motors to home (e.g. Front Left); default all")
     parser.add_argument("--skip-dir-check", action="store_true",
-                        help="Skip the pre-flight direction OD check on nodes 1-6.")
+                        help="skip the pre-flight OD check")
     args = parser.parse_args()
 
-    motors_to_run = {
-        name: nid for name, nid in MOTORS.items()
-        if args.motors is None or name in args.motors
-    }
-    if not motors_to_run:
-        print(f"No matching motors found. Available: {list(MOTORS.keys())}")
+    mode = args.mode or prompt_mode()
+    if mode is None:
         sys.exit(1)
 
-    print(f"Interface : {args.interface}  ({args.bustype})")
-    print(f"Motors    : {list(motors_to_run.keys())}\n")
+    if args.motors is not None:
+        motors = {n: MOTORS[n] for n in args.motors if n in MOTORS}
+        if not motors:
+            print(f"No matching motors. Available: {list(MOTORS)}")
+            sys.exit(1)
+    elif args.mode is not None:
+        motors = dict(MOTORS)     # non-interactive: default to all
+    else:
+        motors = prompt_nodes()
 
-    # Pre-flight gate: every driver must have the correct config ODs before we
-    # move anything. A corrected node needs a power-cycle, so the gate aborts here.
+    print(f"\nInterface : {args.interface} ({args.bustype})")
+    print(f"Mode      : {mode}")
+    print(f"Motors    : {list(motors)}\n")
+
+    # Pre-flight gate: correct config ODs must be in place (and take a power-cycle to apply).
     if args.skip_dir_check:
         print("Skipping pre-flight OD check (--skip-dir-check).\n")
     elif not preflight_od_check(args.interface, args.bustype):
         sys.exit(1)
 
-    threads = []
     try:
-        for name, node_id in motors_to_run.items():
-            t = threading.Thread(
-                target=home_motor,
-                args=(name, node_id, args.interface, args.bustype),
-                daemon=True,
-            )
-            threads.append(t)
-            t.start()
-
-        while any(t.is_alive() for t in threads):
-            time.sleep(0.5)
-
+        MODE_DISPATCH[mode](motors, args.interface, args.bustype)
     except KeyboardInterrupt:
-        print("\nKeyboard interrupt — stopping all motors...")
+        print("\nKeyboard interrupt — stopping...")
         stop_event.set()
-        for t in threads:
-            t.join(timeout=5)
-        print("All threads exited safely.")
+        time.sleep(1)
+        print("Stopped.")
         sys.exit(0)
 
-    print("\nAll motors homed.")
     print("\n===== Final Home Values =====")
-    for name in motors_to_run:
+    for name in motors:
         print(f"  {name}: {home_values.get(name, 'N/A')}")
 
 
