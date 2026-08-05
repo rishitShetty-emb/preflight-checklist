@@ -1,0 +1,287 @@
+#!/usr/bin/env python3
+"""
+CANopen Motor OD Config Verifier
+--------------------------------
+Reads each drive's configuration Object Dictionary over SDO and compares it against
+the concise-config (.cdi) file that was uploaded to that node. Flags any entry whose
+live value has drifted from the intended config.
+
+Source of truth : the per-node .cdi file (index+sub+size, value, download-flag).
+Volatile objects (statusword, actual pos/vel, current, temperature, error state) are
+NOT in the .cdi and are never checked — they change with drive state.
+
+IMPORTANT: run this at PRE-FLIGHT, before the ros2_canopen stack starts. The runtime
+driver reprograms the PDO map (0x1400-0x1BFF), the heartbeat consumer (0x1016) and
+0x6007 at activation, so those only match the .cdi while the drive still holds its
+saved EEPROM config.
+
+Usage:
+    ./verify-motor-config                       # all nodes, useful (actuation) ODs only
+    ./verify-motor-config --node 2              # one node
+    ./verify-motor-config --all --full          # every downloaded OD incl. comms/PDO
+    ./verify-motor-config -i can0 -b socketcan  # override CAN interface
+"""
+
+import argparse
+import glob
+import os
+import sys
+import time
+
+import can
+
+# ── Node -> .cdi mapping ─────────────────────────────────────────────────────────
+# .cdi files live in ../Configs files relative to this script.
+SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
+CONFIG_DIR = os.path.normpath(os.path.join(SCRIPT_DIR, "..", "Configs files"))
+
+# Recognised node-id -> cdi basename. Derived from the filenames in Configs files.
+NODE_CDI = {
+    1: "travel_node_1.cdi",
+    2: "steer_node_2.cdi",
+    3: "travel_node_3.cdi",
+    4: "steer_node_4.cdi",
+    5: "travel_node_5.cdi",
+    6: "steer_node_6.cdi",
+}
+
+CAN_INTERFACE = "can0"
+CAN_BUSTYPE   = "socketcan"
+
+# Authoritative expected values that override the .cdi (the .cdi copy is stale).
+# Keyed by (index, subindex). Applied to every node unless a node-specific entry exists.
+EXPECTED_OVERRIDE = {
+    (0x6099, 0x03): 2,   # Homing_Power_On — should be 2; .cdi still stores 0
+}
+
+# CANopen SDO COB-IDs (expedited).
+SDO_TX_BASE = 0x600   # client -> server (our request)
+SDO_RX_BASE = 0x580   # server -> client (drive response)
+
+# Upload (read) response command bytes by data size.
+SDO_UPLOAD_OK = {0x4F: 1, 0x4B: 2, 0x47: 3, 0x43: 4}
+SDO_ABORT     = 0x80
+
+
+# ── .cdi parsing ─────────────────────────────────────────────────────────────────
+
+class OdEntry:
+    __slots__ = ("index", "sub", "bits", "value", "download")
+
+    def __init__(self, index, sub, bits, value, download):
+        self.index = index
+        self.sub = sub
+        self.bits = bits
+        self.value = value
+        self.download = download
+
+    @property
+    def size_bytes(self):
+        return self.bits // 8
+
+    def tag(self):
+        return f"0x{self.index:04X}:{self.sub:02X}"
+
+
+def parse_cdi(path):
+    """Parse a concise-config .cdi file into OdEntry objects.
+
+    Line format: IIIISSBB,value,flag
+      IIII = index (hex, 4)   SS = subindex (hex, 2)   BB = bit size (hex, 2)
+      value = decimal         flag = True/False (True => downloaded to the drive)
+    """
+    entries = []
+    with open(path, "r") as fh:
+        for lineno, raw in enumerate(fh, 1):
+            line = raw.strip()
+            if not line or line.startswith("#"):
+                continue
+            parts = line.split(",")
+            if len(parts) != 3:
+                print(f"  WARN {os.path.basename(path)}:{lineno} malformed: {line!r}")
+                continue
+            key, val_str, flag_str = (p.strip() for p in parts)
+            if len(key) != 8:
+                print(f"  WARN {os.path.basename(path)}:{lineno} bad key width: {key!r}")
+                continue
+            index = int(key[0:4], 16)
+            sub   = int(key[4:6], 16)
+            bits  = int(key[6:8], 16)
+            value = int(val_str, 0)
+            download = flag_str.lower() == "true"
+            entries.append(OdEntry(index, sub, bits, value, download))
+    return entries
+
+
+# ── Useful/actuation classification ───────────────────────────────────────────────
+
+def is_pdo_object(index):
+    # RPDO comm 0x1400-0x15FF, RPDO map 0x1600-0x17FF, TPDO comm 0x1800-0x19FF,
+    # TPDO map 0x1A00-0x1BFF. Reprogrammed by ros2_canopen at runtime.
+    return 0x1400 <= index <= 0x1BFF
+
+
+def is_useful(index):
+    """Actuation / motor / node-identity config worth verifying."""
+    if index in (0x100B, 0x1016, 0x1017):   # node id + heartbeat
+        return True
+    if index == 0x2010:                      # digital I/O + limit-switch function
+        return True
+    if 0x6000 <= index <= 0x6FFF:            # CiA-402 config, motor params, loops, alarms
+        return True
+    return False
+
+
+def mask(value, bits):
+    return value & ((1 << bits) - 1)
+
+
+# ── SDO read ───────────────────────────────────────────────────────────────────────
+
+def sdo_upload(bus, node_id, index, sub, timeout=0.5, retries=3):
+    """Expedited SDO upload. Returns (value:int|None, err:str|None)."""
+    req = [0x40, index & 0xFF, (index >> 8) & 0xFF, sub, 0, 0, 0, 0]
+    resp_id = SDO_RX_BASE + node_id
+    last_err = "no response"
+    for _ in range(retries):
+        try:
+            bus.send(can.Message(arbitration_id=SDO_TX_BASE + node_id,
+                                 data=req, is_extended_id=False))
+        except can.CanError as exc:
+            return None, f"send failed: {exc}"
+        deadline = time.time() + timeout
+        while True:
+            remaining = deadline - time.time()
+            if remaining <= 0:
+                break
+            frame = bus.recv(timeout=remaining)
+            if frame is None:
+                break
+            if frame.arbitration_id != resp_id or len(frame.data) < 8:
+                continue
+            cmd = frame.data[0]
+            if cmd == SDO_ABORT:
+                code = int.from_bytes(frame.data[4:8], "little")
+                return None, f"SDO abort 0x{code:08X}"
+            if cmd in SDO_UPLOAD_OK:
+                n = SDO_UPLOAD_OK[cmd]
+                return int.from_bytes(frame.data[4:4 + n], "little"), None
+        time.sleep(0.02)
+    return None, last_err
+
+
+# ── Per-node verification ────────────────────────────────────────────────────────
+
+class Result:
+    def __init__(self):
+        self.checked = 0
+        self.passed = 0
+        self.mismatched = []   # (entry, live)
+        self.unread = []       # (entry, err)
+
+
+def verify_node(bus, node_id, entries, full, verbose):
+    res = Result()
+    for e in entries:
+        if not e.download:
+            continue
+        if is_pdo_object(e.index):
+            # PDO objects: only meaningful at preflight and reprogrammed at runtime.
+            # Include only in --full mode.
+            if not full:
+                continue
+        elif not full and not is_useful(e.index):
+            continue
+
+        live, err = sdo_upload(bus, node_id, e.index, e.sub)
+        res.checked += 1
+        if err is not None:
+            res.unread.append((e, err))
+            print(f"  {e.tag()}  UNREAD ({err})")
+            continue
+
+        override = EXPECTED_OVERRIDE.get((e.index, e.sub))
+        expected = override if override is not None else e.value
+        want = mask(expected, e.bits)
+        got = mask(live, e.bits)
+        if got == want:
+            res.passed += 1
+            if verbose:
+                tail = "  PASS (override)" if override is not None else "  PASS"
+                print(f"  {e.tag()}  = {got}{tail}")
+        else:
+            res.mismatched.append((e, got))
+            print(f"  {e.tag()}  MISMATCH  expected {want}  got {got}")
+    return res
+
+
+def resolve_cdi(node_id, explicit):
+    if explicit:
+        return explicit
+    name = NODE_CDI.get(node_id)
+    if not name:
+        return None
+    return os.path.join(CONFIG_DIR, name)
+
+
+def main():
+    ap = argparse.ArgumentParser(
+        description="Verify each drive's OD config against its uploaded .cdi file.",
+        formatter_class=argparse.ArgumentDefaultsHelpFormatter,
+    )
+    ap.add_argument("--interface", "-i", default=CAN_INTERFACE, help="CAN interface")
+    ap.add_argument("--bustype", "-b", default=CAN_BUSTYPE, help="python-can bus type")
+    ap.add_argument("--node", "-n", type=int, help="verify a single node id")
+    ap.add_argument("--all", action="store_true", help="verify all known nodes (default)")
+    ap.add_argument("--cdi", help="explicit .cdi path (implies --node)")
+    ap.add_argument("--full", action="store_true",
+                    help="check every downloaded OD incl. comms/PDO (default: useful only)")
+    ap.add_argument("--verbose", "-v", action="store_true", help="print PASS lines too")
+    args = ap.parse_args()
+
+    if args.cdi and args.node is None:
+        print("--cdi requires --node to know which node id to read from.")
+        sys.exit(2)
+
+    if args.node is not None:
+        targets = [args.node]
+    else:
+        targets = sorted(NODE_CDI)
+
+    scope = "all downloaded ODs (incl. comms/PDO)" if args.full else "useful actuation ODs"
+    print(f"Interface : {args.interface} ({args.bustype})")
+    print(f"Nodes     : {targets}")
+    print(f"Scope     : {scope}")
+    print("NOTE: run before the ros2_canopen stack starts (runtime reprograms PDO/0x1016/0x6007).\n")
+
+    grand_mismatch = 0
+    grand_unread = 0
+    try:
+        with can.interface.Bus(interface=args.bustype, channel=args.interface) as bus:
+            for node_id in targets:
+                cdi_path = resolve_cdi(node_id, args.cdi)
+                if not cdi_path or not os.path.isfile(cdi_path):
+                    print(f"[node {node_id}] no .cdi found ({cdi_path}) — skipping\n")
+                    continue
+                print(f"===== node {node_id}  ({os.path.basename(cdi_path)}) =====")
+                entries = parse_cdi(cdi_path)
+                res = verify_node(bus, node_id, entries, args.full, args.verbose)
+                print(f"  -> checked {res.checked}  pass {res.passed}  "
+                      f"mismatch {len(res.mismatched)}  unread {len(res.unread)}\n")
+                grand_mismatch += len(res.mismatched)
+                grand_unread += len(res.unread)
+    except OSError as exc:
+        print(f"CAN bus error on {args.interface}: {exc}")
+        sys.exit(2)
+
+    print("===== summary =====")
+    print(f"mismatched: {grand_mismatch}   unread: {grand_unread}")
+    if grand_mismatch or grand_unread:
+        print("RESULT: FAIL — config drift or unreachable OD(s) detected.")
+        sys.exit(1)
+    print("RESULT: PASS — all checked ODs match their .cdi.")
+    sys.exit(0)
+
+
+if __name__ == "__main__":
+    main()
