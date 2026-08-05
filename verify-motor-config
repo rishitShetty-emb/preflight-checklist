@@ -48,10 +48,26 @@ NODE_CDI = {
 CAN_INTERFACE = "can0"
 CAN_BUSTYPE   = "socketcan"
 
+STEER_NODES = (2, 4, 6)
+
+# Homing objects (0x6098 Homing_Method, 0x6099 Homing_*, 0x609A Homing_Accel) are only
+# maintained on the steer motors. Homing is not used on the travel motors (nodes 1/3/5),
+# so these objects are NOT verified there.
+def is_homing_object(index):
+    return index in (0x6098, 0x6099, 0x609A)
+
 # Authoritative expected values that override the .cdi (the .cdi copy is stale).
-# Keyed by (index, subindex). Applied to every node unless a node-specific entry exists.
-EXPECTED_OVERRIDE = {
-    (0x6099, 0x03): 2,   # Homing_Power_On — should be 2; .cdi still stores 0
+# Global map — applied to every node.
+EXPECTED_OVERRIDE = {}
+
+# Per-node overrides — take precedence over EXPECTED_OVERRIDE. Keyed by node id.
+# Steer-only homing expectations (the .cdi stores stale values).
+NODE_EXPECTED_OVERRIDE = {
+    n: {
+        (0x6099, 0x03): 2,   # Homing_Power_On  — steer expects 2; .cdi stores 0
+        (0x6099, 0x05): 1,   # Home_Offset_Mode — steer expects 1; .cdi stores 0
+    }
+    for n in STEER_NODES
 }
 
 # CANopen SDO COB-IDs (expedited).
@@ -193,6 +209,10 @@ def verify_node(bus, node_id, entries, full, verbose):
         elif not full and not is_useful(e.index):
             continue
 
+        # Homing config is only maintained on the steer motors.
+        if is_homing_object(e.index) and node_id not in STEER_NODES:
+            continue
+
         live, err = sdo_upload(bus, node_id, e.index, e.sub)
         res.checked += 1
         if err is not None:
@@ -200,7 +220,9 @@ def verify_node(bus, node_id, entries, full, verbose):
             print(f"  {e.tag()}  UNREAD ({err})")
             continue
 
-        override = EXPECTED_OVERRIDE.get((e.index, e.sub))
+        override = NODE_EXPECTED_OVERRIDE.get(node_id, {}).get((e.index, e.sub))
+        if override is None:
+            override = EXPECTED_OVERRIDE.get((e.index, e.sub))
         expected = override if override is not None else e.value
         want = mask(expected, e.bits)
         got = mask(live, e.bits)

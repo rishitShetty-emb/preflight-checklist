@@ -59,6 +59,10 @@ steer (mode 1 Profile Position) = `steering_f`=2, `steering_rl`=4, `steering_rr`
 
 ## 5. Direction & homing
 
+> Homing objects (`0x6098`, `0x6099`, `0x609A`) are only maintained/verified on the **steer**
+> motors (nodes 2/4/6). Homing is not used on the travel motors (1/3/5) — the verifier skips
+> them there. Values below are steer values unless a `steer / travel` split is shown.
+
 | Object | Sub | Name | Type | Value | Used by |
 |---|---|---|---|---|---|
 | `0x607E` | `0x00` | Invert_Dir | u8 | 0 (**node 1 = 1**) | home-w, home-r, `cfg` |
@@ -69,7 +73,7 @@ steer (mode 1 Profile Position) = `steering_f`=2, `steering_rl`=4, `steering_rr`
 | `0x6099` | `0x02` | Homing_Speed_Zero | u32 | 1789568 / 273066 | `cfg` |
 | `0x6099` | `0x03` | Homing_Power_On | u8 | **2** | home-w, home-r, `cfg` |
 | `0x6099` | `0x04` | Homing_Current | i16 | 910 / 421 | `cfg` |
-| `0x6099` | `0x05` | Home_Offset_Mode | u8 | 0 | `cfg` |
+| `0x6099` | `0x05` | Home_Offset_Mode | u8 | 1 (steer) / 0 (travel) — `.cdi` stores 0, steer expected 1 (override) | `cfg` |
 | `0x609A` | `0x00` | Homing_Accel | u32 | 53684 / 8192 | `cfg` |
 | `0x2690` | `0x00` | Encoder Data Reset (vendor) | u8 | write 10 to reset multi-turn | home-w |
 
