@@ -68,7 +68,7 @@ steer (mode 1 Profile Position) = `steering_f`=2, `steering_rl`=4, `steering_rr`
 | `0x607E` | `0x00` | Invert_Dir | u8 | 0 (**node 1 = 1**) | home-w, home-r, `cfg` |
 | `0x6410` | `0x13` | Invert_Dir_Motor | u8 | 1 | home-w, home-r, `cfg` |
 | `0x607C` | `0x00` | Home_Offset | i32 | 0 | `cfg` |
-| `0x6098` | `0x00` | Homing_Method | i8 | 35 | `cfg` |
+| `0x6098` | `0x00` | Homing_Method | i8 | 35 — `.cdi` stores 0, steer override (35 = home-to-current-position; enables saving the zero to EEPROM) | home-w, `cfg` |
 | `0x6099` | `0x01` | Homing_Speed_Switch | u32 | 5368708 / 819200 | `cfg` |
 | `0x6099` | `0x02` | Homing_Speed_Zero | u32 | 1789568 / 273066 | `cfg` |
 | `0x6099` | `0x03` | Homing_Power_On | u8 | **2** | home-w, home-r, `cfg` |

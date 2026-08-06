@@ -11,8 +11,10 @@ Three homing options (interactive menu, or --mode flag):
   2) Assisted align Per node: confirm alignment or jog by +/- counts, then home.
   3) Blind homing   Home at the current position (no sweep, no jog).
 
-All options run the same core homing state machine on each node:
-  mode 6 (Homing) -> CW 0x06 -> encoder reset (0x2690=10) -> CW 0x0F -> CW 0x1F -> save.
+All options run the same core homing state machine on each node, which first verifies
+(and writes, if needed) 0x6098:00 Homing_Method = 35:
+  0x6098=35 -> mode 6 (Homing) -> CW 0x06 -> encoder reset (0x2690=10)
+            -> CW 0x0F -> CW 0x1F -> save.
 
 See docs/specs/2026-08-05-can-home-motors-redesign-design.md.
 """
@@ -64,6 +66,13 @@ HOMING_6099_POWERON_EXPECTED = 2
 HOMING_6099_OFFMODE_INDEX    = 0x6099
 HOMING_6099_OFFMODE_SUB      = 0x05
 HOMING_6099_OFFMODE_EXPECTED = 1
+
+# 0x6098:00 Homing_Method — must be 35 before the homing FSM runs. Unlike the
+# pre-flight ODs above this takes effect on the next homing command, so a
+# correction here does NOT need a power-cycle: we fix it inline and carry on.
+HOMING_METHOD_INDEX    = 0x6098
+HOMING_METHOD_SUB      = 0x00
+HOMING_METHOD_EXPECTED = 35
 
 # CiA-402 operation modes
 MODE_PROFILE_POSITION = 1
@@ -243,10 +252,48 @@ def ensure_clean_enabled(bus, node_id, name, timeout=10):
 
 # ── Core homing state machine (shared by all options) ──────────────────────────
 
+def ensure_homing_method(bus, node_id, name):
+    """
+    Verify 0x6098:00 Homing_Method == 35, writing it if it differs.
+
+    Runs immediately before the homing FSM, for every mode. This one is NOT part of
+    preflight_od_check: that gate treats any correction as "saved to EEPROM, now
+    power-cycle and re-run", which is right for 0x607E/0x6410/0x6099 but wrong here —
+    Homing_Method takes effect on the next homing command, so fixing it inline is
+    enough to carry straight on.
+
+    Returns True if the drive reports 35 by the time we return.
+    """
+    tag = f"0x{HOMING_METHOD_INDEX:04X}:{HOMING_METHOD_SUB:02X} Homing_Method"
+    current = decode_response(
+        send_read_telegram(bus, node_id, HOMING_METHOD_INDEX, HOMING_METHOD_SUB),
+        signed=True)   # i8
+
+    if current is None:
+        print(f"[{name}] {tag}: NO RESPONSE — cannot verify")
+        return False
+    if current == HOMING_METHOD_EXPECTED:
+        print(f"[{name}] {tag} = {current}  PASS")
+        return True
+
+    print(f"[{name}] {tag} = {current}, expected {HOMING_METHOD_EXPECTED} — setting")
+    send_write_telegram(bus, node_id, HOMING_METHOD_INDEX, HOMING_METHOD_SUB,
+                        HOMING_METHOD_EXPECTED, 1)
+    readback = decode_response(
+        send_read_telegram(bus, node_id, HOMING_METHOD_INDEX, HOMING_METHOD_SUB),
+        signed=True)
+    if readback != HOMING_METHOD_EXPECTED:
+        print(f"[{name}] {tag}: write failed (read back {readback})")
+        return False
+    print(f"[{name}] {tag} set to {HOMING_METHOD_EXPECTED}")
+    return True
+
+
 def run_home_state_machine(bus, node_id, name):
     """
     Zero the encoder at the CURRENT position and persist it.
 
+      0. 0x6098 = 35     Homing_Method (verified/corrected first)
       1. 0x6060 = 6      Operation mode = Homing
       2. 0x6040 = 0x06   Controlword: ready (NOT enabled yet)
       3. 0x2690 = 10     Encoder data reset (zero here)
@@ -254,6 +301,10 @@ def run_home_state_machine(bus, node_id, name):
       5. 0x6040 = 0x1F   Controlword: execute homing
       6. 0x1010:01 = "save"  Persist to NVM
     """
+    if not ensure_homing_method(bus, node_id, name):
+        print(f"[{name}] Aborting homing — Homing_Method is not {HOMING_METHOD_EXPECTED}.")
+        return
+
     print(f"[{name}] Homing state machine: mode 6 -> 0x06 -> enc reset -> 0x0F -> 0x1F -> save")
     send_write_telegram(bus, node_id, 0x6060, 0x00, MODE_HOMING, 1)   # Homing mode
     time.sleep(0.2)

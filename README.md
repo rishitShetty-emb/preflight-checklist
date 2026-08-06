@@ -5,6 +5,10 @@ are standalone operator tools — no ROS 2 dependency — that talk directly to 
 hardware over SocketCAN, RTDE, and GPIO. Run them before an operational session
 (validation) or when commissioning/tuning a drive (configuration).
 
+One exception: [`can-home-motor-usb`](#can-home-motor-usb) runs from a **laptop**
+through a USB-CAN adapter instead of on-robot SocketCAN. See
+[USB-CAN adapter setup](#usb-can-adapter-setup-laptop).
+
 ## Buses & node map
 
 | Bus     | Interface | Nodes                                                        |
@@ -108,6 +112,151 @@ all motors safely.
 python3 can-home-motors [-i can0] [-b socketcan] [-m Front Left ...]
 ```
 
+Before the homing state machine runs on a node, `0x6098:00` Homing_Method is
+verified and written to **35** if it differs (applies immediately — no
+power-cycle needed, unlike the pre-flight config ODs).
+
+---
+
+## `can-home-motor-usb`
+
+**Single-node auto-homing from a laptop over a USB-CAN adapter.** Python,
+standalone. Same homing logic and same core state machine as `can-home-motors`,
+with two differences: it talks to a **CANalyst-II / USBCAN-2A** USB adapter
+instead of SocketCAN, and it homes exactly **one** node per run.
+
+Same three modes (`full` sweep→midpoint, `align` jog, `blind` home-in-place) and
+the same FSM:
+
+```
+0x6098=35 → 0x6060=6 → CW 0x06 → 0x2690=10 → CW 0x0F → CW 0x1F → 0x1010:01="save"
+```
+
+```
+python can-home-motor-usb.py --node 2 --mode blind
+python can-home-motor-usb.py                        # menus for mode + node
+```
+
+| Flag | Default | Meaning |
+|---|---|---|
+| `--node` / `-n` | prompts | CANopen node ID, 1–127 |
+| `--mode` / `-M` | prompts | `full` \| `align` \| `blind` |
+| `--channel` / `-c` | `0` | adapter CAN port: `0` = CAN1, `1` = CAN2 |
+| `--bitrate` | `1000000` | bit/s (AMR bus is 1 Mbit/s) |
+| `--bustype` / `-b` | `canalystii` | python-can backend; `socketcan` to run on the robot |
+| `-y` | off | skip the non-steer-node confirmation |
+| `--skip-dir-check` | off | skip the pre-flight OD check |
+
+Behaviour worth knowing:
+
+- **Fail-fast probe.** Reads `0x1000:00` (Device Type) before writing anything. If
+  the node is silent it drops the receive filter and lists any bus traffic, which
+  separates "bus/wiring/bitrate dead" from "bus fine, wrong node ID".
+- **Pre-flight OD check covers only the target node** — so a bench setup with a
+  single drive connected works. Nodes with no expectation on record skip
+  `0x607E`/`0x6410`; non-steer nodes skip `0x6099:03`/`:05`.
+- **Ctrl-C sends Shutdown** (`0x6040=0x0006`) to drop torque before exiting.
+- **`full` mode sweeps for mechanical hard stops.** The steer axes (2/4/6) have
+  them; the travel wheels (1/3/5) do not, so on a travel node each sweep runs to
+  its 300 s timeout while the wheel turns. Pick the mode to match the axis.
+- Every successful run writes the new encoder zero to **NVM**, replacing the
+  previous home reference.
+
+---
+
+## USB-CAN adapter setup (laptop)
+
+Setup for `can-home-motor-usb`. The adapter is a **Zhuhai Chuangxin
+USBCAN-2A / CANalyst-II** (`VID_04D8` / `PID_0053`), two CAN channels.
+
+### 1. Install the driver
+
+Run either installer (Windows):
+
+```
+USB-CAN-B-Driver-Setup(V1.40).exe
+USB_CAN TOOL/driver/dpinst64.exe      # or dpinst32.exe on 32-bit
+```
+
+This binds the device to **WinUSB** via `mchpwinusb.inf`.
+
+> The adapter is **not** a virtual COM port. No `COMx` will ever appear in Device
+> Manager, and that is correct — frames travel as raw USB bulk transfers. Don't go
+> looking for a serial port.
+
+Confirm it enumerated (PowerShell):
+
+```powershell
+Get-PnpDevice -PresentOnly | Where-Object { $_.InstanceId -match 'VID_04D8' } |
+  Select-Object Status, Class, FriendlyName, InstanceId
+```
+
+Expected — `Status: OK`, class `CustomUSBDevices`:
+
+```
+OK   CustomUSBDevices   WinUSB Device   USB\VID_04D8&PID_0053\...
+```
+
+### 2. Install the Python packages
+
+```
+pip install python-can canalystii libusb-package
+```
+
+`libusb-package` ships `libusb-1.0.dll`, which pyusb needs. Without a libusb on
+the DLL search path the bus fails to open with **`No backend available`** even
+though the adapter is fine. The script puts the bundled DLL on `PATH` at import
+time, so installing this package is all that's required.
+
+The vendor `ControlCAN.dll` is **not** used: it is 32-bit only and cannot be
+loaded from 64-bit Python. The `canalystii` backend drives the same WinUSB device
+in pure Python.
+
+### 3. Wire the CAN side
+
+- CAN-H → CAN-H, CAN-L → CAN-L (not swapped), and **share GND** with the drives.
+- 120 Ω termination at both ends of the bus.
+- Note which physical connector you use: `CAN1` → `--channel 0`, `CAN2` →
+  `--channel 1`. The robot-side names (`can0`, `can1`) do **not** map to the
+  adapter — the channel is whichever port you plugged into.
+- Match `--bitrate` to the bus. AMR (`can0`) is **1 Mbit/s**.
+
+### 4. Close the vendor GUI
+
+`USB_CAN_Tool.exe` claims the adapter exclusively. If it's open, the script fails
+with an `Access denied` / backend error. Close it first.
+
+### 5. Verify communication
+
+```
+python can-home-motor-usb.py --node 1 --mode blind
+```
+
+A working bus prints the probe result before anything is written:
+
+```
+[wheel_f] Probing node 1...
+[wheel_f] Node 1 responded: 0x1000:00 (Device Type) = 0x00020192
+```
+
+`0x00020192` decodes as `0x0192` = 402 → CiA-402 drive profile, `0x0002` = servo
+drive. That is a confirmed SDO round trip.
+
+> Stop here if you only wanted to confirm the link — the command above **continues
+> into homing** and writes a new encoder zero to NVM. Ctrl-C at the probe line if
+> that isn't what you want.
+
+### Troubleshooting
+
+| Symptom | Cause |
+|---|---|
+| `No backend available` | pyusb found no libusb → `pip install libusb-package` |
+| `No Canalyst-II USB device found` | adapter unplugged, or driver not installed (step 1) |
+| `Access denied (insufficient permissions)` | another process holds it — usually `USB_CAN_Tool.exe` |
+| Node silent, **no** bus traffic listed | drives unpowered, wrong `--channel`, wiring/termination, or wrong `--bitrate` |
+| Node silent, but other IDs listed | bus is fine — wrong node ID, or that one drive is off |
+| No `COMx` in Device Manager | expected; this is a WinUSB device, not a serial port |
+
 ---
 
 ## `gpio_preflight_check`
@@ -131,8 +280,10 @@ sudo gpio_preflight_check
 ## Notes
 
 - CAN scripts assume the relevant interface is already up (e.g.
-  `ip link set can0 up type can bitrate 1000000`).
-- The tuning and homing scripts write to drive NVM only when you confirm; values
-  are otherwise volatile and revert on power cycle.
+  `ip link set can0 up type can bitrate 1000000`). `can-home-motor-usb` is the
+  exception — it configures the adapter itself from `--bitrate`.
+- The `*_pid_tune` scripts write to drive NVM only when you confirm; values are
+  otherwise volatile and revert on power cycle. The homing scripts are different:
+  the save to NVM is part of the homing state machine and is **not** prompted.
 - These are operator tools, not services — they are meant to be run by hand and
   read interactively.

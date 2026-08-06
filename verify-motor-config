@@ -64,6 +64,7 @@ EXPECTED_OVERRIDE = {}
 # Steer-only homing expectations (the .cdi stores stale values).
 NODE_EXPECTED_OVERRIDE = {
     n: {
+        (0x6098, 0x00): 35,  # Homing_Method    — steer expects 35 (home-to-current-pos); .cdi stores 0
         (0x6099, 0x03): 2,   # Homing_Power_On  — steer expects 2; .cdi stores 0
         (0x6099, 0x05): 1,   # Home_Offset_Mode — steer expects 1; .cdi stores 0
     }
