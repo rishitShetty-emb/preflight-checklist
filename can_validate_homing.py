@@ -45,6 +45,7 @@ is read/move/compare only (aside from the moves needed to displace each
 axis before the power-cycle test).
 """
 import argparse
+import subprocess
 import sys
 import time
 import can
@@ -78,6 +79,11 @@ RECONNECT_POLL_SEC    = 1.0
 
 MULTITURN_INDEX = 0x3000   # vendor-specific -- multi-turn absolute position, counts
 MULTITURN_SUB   = 0x17
+
+# One-time GPIO pre-flight -- must run BEFORE anything else (same call as the
+# gpio_preflight() step in the latest can-home-motors). Equivalent to:
+#   sudo gpioset gpiochip2 2=0 3=0 6=1
+GPIO_PREFLIGHT_CMD = ["sudo", "gpioset", "gpiochip2", "2=0", "3=0", "6=1"]
 
 # CiA-402 operation modes
 MODE_PROFILE_POSITION = 1
@@ -236,8 +242,29 @@ def ensure_clean_enabled(bus, node_id, name, timeout=10):
     if sw is not None and (sw & SW_OP_ENABLED):
         print(f"[{name}] Clean & enabled (SW=0x{sw & 0xFFFF:04X})")
         return True
-    print(f"[{name}] WARN: not Operation-Enabled after enable (SW=0x{(sw or 0) & 0xFFFF:04X})")
+    err = get_error_code(bus, node_id)
+    print(f"[{name}] WARN: not Operation-Enabled after enable "
+          f"(SW=0x{(sw or 0) & 0xFFFF:04X} err=0x{(err or 0):04X})")
     return False
+
+
+# ── One-time GPIO pre-flight ────────────────────────────────────────────────
+def gpio_preflight():
+    """
+    Drive the required GPIO lines once, before anything else -- identical to
+    the gpio_preflight() step in the latest can-home-motors, so this script
+    puts the controller-compute board into the same state (recovery active,
+    halt disabled, dev mode on) before it opens the CAN bus. If it fails, tell
+    the operator and abort -- the CAN controllers must be brought down first.
+    """
+    print("===== GPIO pre-flight: " + " ".join(GPIO_PREFLIGHT_CMD) + " =====")
+    try:
+        subprocess.run(GPIO_PREFLIGHT_CMD, check=True)
+    except (subprocess.CalledProcessError, FileNotFoundError, OSError) as exc:
+        print(f"GPIO pre-flight command FAILED: {exc}")
+        print("kill the controllers using supervisord")
+        sys.exit(1)
+    print("GPIO pre-flight lines set.\n")
 
 
 # ── Step 1+2: displace each wheel and record the "before" position ──────────
@@ -389,6 +416,9 @@ def main():
     parser.add_argument("--tolerance", type=int, default=TOLERANCE_COUNTS,
                          help="allowed +/- drift (encoder counts) after the power cycle")
     args = parser.parse_args()
+
+    # One-time GPIO pre-flight -- must succeed before anything else runs.
+    gpio_preflight()
 
     if args.motors is not None:
         motors = {n: MOTORS[n] for n in args.motors if n in MOTORS}
