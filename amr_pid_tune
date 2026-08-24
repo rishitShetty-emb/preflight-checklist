@@ -9,16 +9,21 @@ travel motors.
 
   Step  Parameter       OD           Description
   ────  ─────────────   ──────────   ──────────────────────────────────────
-  1     Kvp             0x60F9:01    Velocity proportional gain
-  2     Kvi             0x60F9:03    Velocity integral gain
-  3     Kvi_Sum_Limit   0x60F9:0C    Velocity integrator anti-windup cap
-  4     Speed_Fb_N      0x60F9:05    Velocity feedback filter coefficient
-  5     Kpp             0x60FB:01    Position proportional gain
-  6     Kvff            0x60FB:02    Velocity feed-forward (K_Velocity_FF)
+  1     Kcp             0x60F6:01    Current (torque) loop proportional gain
+  2     Kci             0x60F6:02    Current (torque) loop integral gain
+  3     Kvp             0x60F9:01    Velocity proportional gain
+  4     Kvi             0x60F9:03    Velocity integral gain
+  5     Kvi_Sum_Limit   0x60F9:0C    Velocity integrator anti-windup cap
+  6     Speed_Fb_N      0x60F9:05    Velocity feedback filter coefficient
+  7     Kpp             0x60FB:01    Position proportional gain
+  8     Kvff            0x60FB:02    Velocity feed-forward (K_Velocity_FF)
+
+Loops are cascaded (current → velocity → position); tune the innermost first.
 
 Design constraints (enforced as reminders):
-  - Filter BW  ≥  2 × Velocity loop BW   (avoids oscillation)
-  - Kpp target  <  ¼ × Velocity loop BW  (position BW < velocity BW)
+  - Current loop BW  >  Velocity loop BW  (innermost loop must be fastest)
+  - Filter BW  ≥  2 × Velocity loop BW    (avoids oscillation)
+  - Kpp target  <  ¼ × Velocity loop BW   (position BW < velocity BW)
 
 Usage:
   python3 amr_pid_tune [--iface can0] [--nodes 1 3 5]
@@ -48,6 +53,20 @@ DEFAULT_NODES = [1, 3, 5]
 # (name, index, subindex, label, post_set_note)
 
 _PARAMS = [
+    (
+        'Kcp', 0x60F6, 0x01,
+        'Current (torque) loop proportional gain (Kcp)',
+        'Innermost loop — tune this FIRST, before velocity and position.\n'
+        '      Sets current-loop bandwidth, which must stay ABOVE the velocity loop BW.\n'
+        '      Too high causes audible whine / current ripple; too low makes the outer\n'
+        '      loops sluggish.',
+    ),
+    (
+        'Kci', 0x60F6, 0x02,
+        'Current (torque) loop integral gain (Kci)',
+        'Removes steady-state current (torque) error. Raise gradually alongside Kcp;\n'
+        '      excessive Kci causes current overshoot and heating.',
+    ),
     (
         'Kvp', 0x60F9, 0x01,
         'Velocity proportional gain (Kvp)',
