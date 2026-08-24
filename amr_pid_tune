@@ -10,7 +10,7 @@ travel motors.
   Step  Parameter       OD           Description
   ────  ─────────────   ──────────   ──────────────────────────────────────
   1     Kcp             0x60F6:01    Current (torque) loop proportional gain
-  2     Kci             0x60F6:02    Current (torque) loop integral gain
+  2     Ki              0x60F6:02    Current (torque) loop integral gain
   3     Kvp             0x60F9:01    Velocity proportional gain
   4     Kvi             0x60F9:03    Velocity integral gain
   5     Kvi_Sum_Limit   0x60F9:0C    Velocity integrator anti-windup cap
@@ -62,10 +62,10 @@ _PARAMS = [
         '      loops sluggish.',
     ),
     (
-        'Kci', 0x60F6, 0x02,
-        'Current (torque) loop integral gain (Kci)',
+        'Ki', 0x60F6, 0x02,
+        'Current (torque) loop integral gain (Ki)',
         'Removes steady-state current (torque) error. Raise gradually alongside Kcp;\n'
-        '      excessive Kci causes current overshoot and heating.',
+        '      excessive Ki causes current overshoot and heating.',
     ),
     (
         'Kvp', 0x60F9, 0x01,
