@@ -25,8 +25,12 @@ Design constraints (enforced as reminders):
   - Filter BW  ≥  2 × Velocity loop BW    (avoids oscillation)
   - Kpp target  <  ¼ × Velocity loop BW   (position BW < velocity BW)
 
+By default a gain is entered once and written to all nodes. Pass --per-node to
+enter a separate value for each node (e.g. to trim one wheel), or restrict the
+set with --nodes (e.g. --nodes 3 to touch only node 3).
+
 Usage:
-  python3 amr_pid_tune [--iface can0] [--nodes 1 3 5]
+  python3 amr_pid_tune [--iface can0] [--nodes 1 3 5] [--per-node]
 """
 
 import argparse
@@ -228,13 +232,27 @@ def _values_uniform(nodes, cur_vals):
     present = [cur_vals[nid] for nid in nodes if cur_vals.get(nid) is not None]
     return len(set(present)) <= 1
 
+
+def _parse_int(raw):
+    """Parse a gain entry: '' → None (skip/leave unchanged); prints and returns None on bad input."""
+    raw = raw.strip()
+    if raw == '':
+        return None
+    try:
+        return int(raw)
+    except ValueError:
+        print(_red(f'    Invalid integer "{raw}" — skipped.'))
+        return None
+
 # ── Main configurator ─────────────────────────────────────────────────────────
 
-def configure(iface, nodes):
+def configure(iface, nodes, per_node=False):
+    mode_txt = 'per-node (individual)' if per_node else 'all nodes together'
     print()
     print(_bold('═' * 60))
     print(_bold('  AMR Travel-Motor PID Configurator'))
     print(_bold(f'  Interface: {iface}   Nodes: {", ".join(str(n) for n in nodes)}'))
+    print(_bold(f'  Mode: {mode_txt}'))
     print(_bold('═' * 60))
     print()
 
@@ -275,15 +293,42 @@ def configure(iface, nodes):
         if not _values_uniform(nodes, cur_vals):
             print(_yellow('    ⚠ Nodes are NOT uniform for this parameter.'))
 
-        # ── Prompt once for the value applied to all nodes ────────────────────
-        try:
-            raw = input('    New value for ALL nodes (Enter to leave unchanged): ').strip()
-        except (EOFError, KeyboardInterrupt):
-            print()
-            print(_yellow('\nAborted.'))
+        # ── Collect the new value(s) ──────────────────────────────────────────
+        # per_node: prompt each node separately (lets wheels carry different gains).
+        # otherwise: prompt once and apply the same value to every node.
+        new_by_node = {}   # nid -> new_val, only for nodes to actually (re)write
+        aborted = False
+
+        if per_node:
+            for nid in nodes:
+                cur_txt = cur_vals[nid] if cur_vals.get(nid) is not None else 'N/A'
+                try:
+                    raw = input(f'    New value for node {nid} '
+                                f'(current {cur_txt}, Enter to skip): ')
+                except (EOFError, KeyboardInterrupt):
+                    print()
+                    print(_yellow('\nAborted.'))
+                    aborted = True
+                    break
+                val = _parse_int(raw)
+                if val is not None:
+                    new_by_node[nid] = val
+        else:
+            try:
+                raw = input('    New value for ALL nodes (Enter to leave unchanged): ')
+            except (EOFError, KeyboardInterrupt):
+                print()
+                print(_yellow('\nAborted.'))
+                break
+            val = _parse_int(raw)
+            if val is not None:
+                for nid in nodes:
+                    new_by_node[nid] = val
+
+        if aborted:
             break
 
-        if raw == '':
+        if not new_by_node:
             if _values_uniform(nodes, cur_vals):
                 print(_yellow('    → Leaving current value unchanged.'))
             else:
@@ -291,35 +336,31 @@ def configure(iface, nodes):
             print()
             continue
 
-        try:
-            new_val = int(raw)
-        except ValueError:
-            print(_red(f'    Invalid integer "{raw}" — skipping this parameter.'))
-            print()
-            continue
-
-        # ── Write to every node ───────────────────────────────────────────────
-        print(f'    Writing {new_val} → 0x{index:04X}:{subindex:02X} on all nodes...')
+        # ── Write only the requested node(s) ──────────────────────────────────
         write_ok = {}
-        for nid in nodes:
+        for nid, new_val in new_by_node.items():
+            print(f'    Writing {new_val} → 0x{index:04X}:{subindex:02X} on node {nid}...')
             ok = sdo_write(sock, nid, index, subindex, new_val, n_bytes)
             write_ok[nid] = ok
             if not ok:
                 print(_red(f'      node {nid}: write FAILED'))
 
-        # ── Read back from every node to confirm ──────────────────────────────
+        # ── Read back every node to confirm (untouched nodes shown for context) ─
         confirm_parts = []
         for nid in nodes:
             readback, _ = sdo_read(sock, nid, index, subindex)
+            expected = new_by_node.get(nid)
             if readback is None:
                 confirm_parts.append(_yellow(f'n{nid}=? (readback failed)'))
-            elif readback == new_val:
+            elif expected is None:
+                confirm_parts.append(f'n{nid}={readback}')  # not written this step
+            elif readback == expected:
                 confirm_parts.append(_green(f'n{nid} ✓'))
             else:
                 confirm_parts.append(_yellow(f'n{nid}⚠ read {readback}'))
         print(f'    Readback: {"  ".join(confirm_parts)}')
 
-        changes.append((name, index, subindex, dict(cur_vals), new_val, dict(write_ok)))
+        changes.append((name, index, subindex, dict(cur_vals), dict(new_by_node), dict(write_ok)))
 
         # ── Post-set guidance ─────────────────────────────────────────────────
         if note:
@@ -338,13 +379,16 @@ def configure(iface, nodes):
         print('  No parameters were changed.')
     else:
         col = max(len(n) for n, *_ in changes)
-        for name, index, subindex, _old, new_val, write_ok in changes:
-            flags = '  '.join(
-                (_green(f'n{nid} ✓') if write_ok.get(nid) else _red(f'n{nid} ✗'))
-                for nid in nodes
-            )
-            print(f'  {name:<{col}}  0x{index:04X}:{subindex:02X}  '
-                  f'→ {_green(str(new_val))}   [{flags}]')
+        for name, index, subindex, _old, new_by_node, write_ok in changes:
+            parts = []
+            for nid in nodes:
+                if nid in new_by_node:
+                    ok = write_ok.get(nid)
+                    tag = ' ✓' if ok else ' ✗'
+                    parts.append((_green if ok else _red)(f'n{nid}={new_by_node[nid]}{tag}'))
+                else:
+                    parts.append(f'n{nid}=—')  # left unchanged this run
+            print(f'  {name:<{col}}  0x{index:04X}:{subindex:02X}  [{"  ".join(parts)}]')
 
     print()
 
@@ -369,15 +413,19 @@ def configure(iface, nodes):
 
 def main():
     parser = argparse.ArgumentParser(
-        description='Interactive AMR travel-motor PID configurator via CAN SDO '
-                    '(writes identical values to all nodes)')
+        description='Interactive AMR travel-motor PID configurator via CAN SDO. '
+                    'By default each gain is written identically to all nodes; use '
+                    '--per-node to enter a separate value per node.')
     parser.add_argument('--iface', default=DEFAULT_IFACE,
                         help=f'CAN interface (default: {DEFAULT_IFACE})')
     parser.add_argument('--nodes', type=int, nargs='+', default=DEFAULT_NODES,
                         metavar='ID',
                         help=f'CANopen node IDs (default: {" ".join(map(str, DEFAULT_NODES))})')
+    parser.add_argument('--per-node', action='store_true',
+                        help='Prompt for each gain per node (different values per wheel) '
+                             'instead of one value applied to all nodes.')
     args = parser.parse_args()
-    configure(args.iface, args.nodes)
+    configure(args.iface, args.nodes, per_node=args.per_node)
 
 
 if __name__ == '__main__':
