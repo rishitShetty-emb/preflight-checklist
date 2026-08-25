@@ -134,6 +134,27 @@ def send_nmt(sock, command, node_id):
     sock.send(struct.pack('=IB3x8s', 0x000, 2, payload))
 
 
+def _drain(sock):
+    """Discard any buffered/stale CAN frames so a late response to a PREVIOUS
+    request (or another SDO client on the bus) can't be mis-attributed to the
+    next request. Called right before each SDO exchange."""
+    sock.settimeout(0.0)
+    try:
+        while True:
+            sock.recv(FRAME_SZ)
+    except (BlockingIOError, socket.timeout, OSError):
+        pass
+    finally:
+        sock.settimeout(0.5)
+
+
+def _resp_matches(rdata, index, subindex):
+    """True if this SDO response frame is for the object we asked for. The server
+    echoes index (bytes 1-2, LE) + subindex (byte 3); matching on them prevents a
+    stale/concurrent 0x580+id frame from landing on the wrong parameter."""
+    return struct.unpack_from('<H', rdata, 1)[0] == index and rdata[3] == subindex
+
+
 def sdo_read(sock, node_id, index, subindex, timeout=0.5):
     """
     Expedited SDO upload. Returns (value: int, n_bytes: int) or (None, None).
@@ -141,6 +162,7 @@ def sdo_read(sock, node_id, index, subindex, timeout=0.5):
     """
     cob_req  = 0x600 + node_id
     cob_resp = 0x580 + node_id
+    _drain(sock)
     req = struct.pack('<BHBB4x', 0x40, index, subindex, 0)
     try:
         sock.send(struct.pack('=IB3x8s', cob_req, 8, req))
@@ -154,6 +176,8 @@ def sdo_read(sock, node_id, index, subindex, timeout=0.5):
             rid, _dlc, rdata = struct.unpack(CAN_FRAME_FMT, raw)
             if (rid & 0x1FFFFFFF) != cob_resp:
                 continue
+            if not _resp_matches(rdata, index, subindex):
+                continue  # response for a different object — skip, keep waiting
             if rdata[0] == 0x80:
                 abort = struct.unpack_from('<I', rdata, 4)[0]
                 print(_red(f'  [node {node_id} SDO abort] 0x{abort:08X}'))
@@ -181,6 +205,7 @@ def sdo_write(sock, node_id, index, subindex, value, n_bytes, timeout=0.5):
     data = value.to_bytes(n_bytes, 'little', signed=(value < 0))
     data = data.ljust(4, b'\x00')
     req = struct.pack('<BHB4s', cmd, index, subindex, data)
+    _drain(sock)
     try:
         sock.send(struct.pack('=IB3x8s', cob_req, 8, req))
     except OSError as exc:
@@ -193,6 +218,8 @@ def sdo_write(sock, node_id, index, subindex, value, n_bytes, timeout=0.5):
             rid, _dlc, rdata = struct.unpack(CAN_FRAME_FMT, raw)
             if (rid & 0x1FFFFFFF) != cob_resp:
                 continue
+            if not _resp_matches(rdata, index, subindex):
+                continue  # ack/abort for a different object — skip, keep waiting
             if rdata[0] == 0x80:
                 abort = struct.unpack_from('<I', rdata, 4)[0]
                 print(_red(f'  [node {node_id} SDO abort] 0x{abort:08X}'))
