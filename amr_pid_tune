@@ -12,7 +12,7 @@ travel motors.
   1     Kcp             0x60F6:01    Current (torque) loop proportional gain
   2     Ki              0x60F6:02    Current (torque) loop integral gain
   3     Kvp             0x60F9:01    Velocity proportional gain
-  4     Kvi             0x60F9:03    Velocity integral gain
+  4     Kvi             0x60F9:02    Velocity integral gain
   5     Kvi_Sum_Limit   0x60F9:0C    Velocity integrator anti-windup cap
   6     Speed_Fb_N      0x60F9:05    Velocity feedback filter coefficient
   7     Kpp             0x60FB:01    Position proportional gain
@@ -79,7 +79,7 @@ _PARAMS = [
         '      Set your filter accordingly before closing the loop.',
     ),
     (
-        'Kvi', 0x60F9, 0x03,
+        'Kvi', 0x60F9, 0x02,
         'Velocity integral gain (Kvi)',
         'Kvi eliminates steady-state error. Increase gradually — too high causes overshoot.',
     ),
