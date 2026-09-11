@@ -1,0 +1,374 @@
+#!/usr/bin/env python3
+"""
+Configurable-OD Value Reader
+----------------------------
+Reads every configurable Object Dictionary entry from the AMR chassis (Kinco
+FD12X/FD1X4S, nodes 1-6 on can0) and the liftkit (Kinco FD1X5, node 7 on can1)
+over expedited SDO and prints them in a tabular, tier-tagged report.
+
+Object set mirrors `actuator_od_configurable_risk_register.md` — the same
+FATAL / PERSISTENT / TUNING / COMMS taxonomy, so a row here maps 1:1 to a row
+there. Pure read-only telemetry (statusword, actual pos/vel/current, temps) is
+intentionally excluded; it is not configurable and changes with drive state.
+
+IMPORTANT: run at PRE-FLIGHT, before the ros2_canopen stack starts. The runtime
+driver reprograms the PDO map (0x1400-0x1BFF), the heartbeat consumer (0x1016)
+and 0x6007 at activation, so those only read the saved EEPROM config while the
+stack is down.
+
+Bus / node map (from SDO.md + liftkit_bus.yml):
+  can0 : AMR — travel wheel_f=1 wheel_rl=3 wheel_rr=5 (Profile Velocity);
+               steer steering_f=2 steering_rl=4 steering_rr=6 (Profile Position)
+  can1 : liftkit node 7  (tool node 8 is a CiA-301 I/O device — no config OD)
+
+Usage:
+  ./read_od_values                       # AMR (can0) + liftkit (can1)
+  ./read_od_values --amr-only
+  ./read_od_values --lift-only
+  ./read_od_values --nodes 2 4 6         # subset of AMR nodes
+  ./read_od_values --amr-iface can0 --lift-iface can1
+  ./read_od_values --hex                 # values in hex as well as decimal
+"""
+
+import argparse
+import socket
+import struct
+import sys
+import time
+
+# ── CAN frame plumbing (raw SocketCAN, expedited SDO) ────────────────────────────
+CAN_FRAME_FMT = '=IB3x8s'
+FRAME_SZ = struct.calcsize(CAN_FRAME_FMT)
+
+DEFAULT_AMR_IFACE = 'can0'
+DEFAULT_LIFT_IFACE = 'can1'
+AMR_NODES = (1, 2, 3, 4, 5, 6)
+STEER_NODES = (2, 4, 6)
+LIFT_NODE = 7
+
+_IS_TTY = sys.stdout.isatty()
+
+
+def _bold(s):   return f'\033[1m{s}\033[0m'  if _IS_TTY else s
+def _cyan(s):   return f'\033[36m{s}\033[0m' if _IS_TTY else s
+def _green(s):  return f'\033[32m{s}\033[0m' if _IS_TTY else s
+def _yellow(s): return f'\033[33m{s}\033[0m' if _IS_TTY else s
+def _red(s):    return f'\033[31m{s}\033[0m' if _IS_TTY else s
+def _grey(s):   return f'\033[90m{s}\033[0m' if _IS_TTY else s
+
+
+# ── Type table: width (bytes) + signedness for display ───────────────────────────
+_TYPE = {
+    'u8': (1, False), 'i8': (1, True),
+    'u16': (2, False), 'i16': (2, True),
+    'u32': (4, False), 'i32': (4, True),
+}
+
+# Homing objects are only maintained on the steer motors (2/4/6); travel nodes
+# (1/3/5) never home, so these are shown as "—" there rather than read.
+_HOMING_INDEXES = (0x6098, 0x6099, 0x609A)
+
+
+def open_can_socket(iface):
+    sock = socket.socket(socket.AF_CAN, socket.SOCK_RAW, socket.CAN_RAW)
+    sock.bind((iface,))
+    sock.settimeout(0.5)
+    return sock
+
+
+def _drain(sock):
+    """Discard buffered/stale frames so a late response to a previous request (or
+    another SDO client) can't be mis-attributed to the next read."""
+    sock.settimeout(0.0)
+    try:
+        while True:
+            sock.recv(FRAME_SZ)
+    except (BlockingIOError, socket.timeout, OSError):
+        pass
+    finally:
+        sock.settimeout(0.5)
+
+
+def _resp_matches(rdata, index, subindex):
+    """Server echoes index (bytes 1-2 LE) + subindex (byte 3); match on them so a
+    stale/concurrent 0x580+id frame can't land on the wrong parameter."""
+    return struct.unpack_from('<H', rdata, 1)[0] == index and rdata[3] == subindex
+
+
+def sdo_read(sock, node_id, index, subindex, signed, timeout=0.5):
+    """Expedited SDO upload. Returns (value:int, 'ok') or (None, reason).
+    Width comes from the drive's response cmd byte; signedness from the caller."""
+    cob_req = 0x600 + node_id
+    cob_resp = 0x580 + node_id
+    _drain(sock)
+    req = struct.pack('<BHBB4x', 0x40, index, subindex, 0)
+    try:
+        sock.send(struct.pack('=IB3x8s', cob_req, 8, req))
+    except OSError as exc:
+        return None, f'send:{exc.errno}'
+    deadline = time.monotonic() + timeout
+    while time.monotonic() < deadline:
+        try:
+            raw = sock.recv(FRAME_SZ)
+        except socket.timeout:
+            continue
+        rid, _dlc, rdata = struct.unpack(CAN_FRAME_FMT, raw)
+        if (rid & 0x1FFFFFFF) != cob_resp:
+            continue
+        if not _resp_matches(rdata, index, subindex):
+            continue
+        if rdata[0] == 0x80:
+            abort = struct.unpack_from('<I', rdata, 4)[0]
+            return None, f'abort 0x{abort:08X}'
+        cmd = rdata[0]
+        n_bytes = 4 - ((cmd >> 2) & 0x03) if (cmd & 0x02) else 4
+        value = int.from_bytes(rdata[4:4 + n_bytes], 'little', signed=signed)
+        return value, 'ok'
+    return None, 'timeout'
+
+
+# ── Object registry ──────────────────────────────────────────────────────────────
+# Each row: (index, sub, type, tier, name). Tier ∈ FATAL/PERSIST/TUNING/COMMS.
+# AMR set is read on nodes 1-6 (can0); LIFT set on node 7 (can1). Types are from
+# SDO.md where listed and Kinco manual conventions otherwise; only signedness
+# affects the printed value (width is taken from the drive's own response).
+
+AMR_OBJECTS = [
+    # ── FATAL — hardware-damage / uncommanded-motion risk ──
+    (0x6073, 0x00, 'u16', 'FATAL', 'CMD_q_Max (max current, Arms)'),
+    (0x60F7, 0x01, 'u16', 'FATAL', 'Brake resistor resistance'),
+    (0x60F7, 0x02, 'u16', 'FATAL', 'Brake resistor power'),
+    (0x6410, 0x11, 'u16', 'FATAL', 'Brake duty cycle'),
+    (0x6410, 0x12, 'u16', 'FATAL', 'Brake delay (ms)'),
+    # ── PERSIST — repeating-fault / won't-run / silent-mask risk ──
+    (0x6065, 0x00, 'u32', 'PERSIST', 'Max_Following_Error'),
+    (0x6067, 0x00, 'u32', 'PERSIST', 'Target_Pos_Window'),
+    (0x2508, 0x09, 'u16', 'PERSIST', 'Position_Window_time'),
+    (0x607D, 0x01, 'i32', 'PERSIST', 'Soft_Positive_Limit'),
+    (0x607D, 0x02, 'i32', 'PERSIST', 'Soft_Negative_Limit'),
+    (0x2010, 0x19, 'u8',  'PERSIST', 'Limit_Function'),
+    (0x6098, 0x00, 'i8',  'PERSIST', 'Homing_Method (steer)'),
+    (0x6099, 0x05, 'u8',  'PERSIST', 'Home_Offset_Mode (steer)'),
+    (0x605A, 0x00, 'i16', 'PERSIST', 'Quick_Stop_Mode'),
+    (0x605B, 0x00, 'i16', 'PERSIST', 'Shutdown_Stop_Mode'),
+    (0x605C, 0x00, 'i16', 'PERSIST', 'Disable_Stop_Mode'),
+    (0x605D, 0x00, 'i16', 'PERSIST', 'Halt_Mode'),
+    (0x605E, 0x00, 'i16', 'PERSIST', 'Fault_Stop_Mode'),
+    (0x6007, 0x00, 'i16', 'PERSIST', 'Abort_Connection_Mode'),
+    (0x2010, 0x03, 'u16', 'PERSIST', 'Din_Function 1'),
+    (0x2010, 0x04, 'u16', 'PERSIST', 'Din_Function 2'),
+    (0x2010, 0x05, 'u16', 'PERSIST', 'Din_Function 3'),
+    (0x2010, 0x06, 'u16', 'PERSIST', 'Din_Function 4'),
+    (0x2010, 0x0F, 'u16', 'PERSIST', 'Dout_Function 1'),
+    (0x2010, 0x10, 'u16', 'PERSIST', 'Dout_Function 2'),
+    # ── TUNING — performance/stability (register: "DO NOT TOUCH") ──
+    (0x60F6, 0x01, 'u16', 'TUNING', 'Kcp (current-loop P)'),
+    (0x60F6, 0x02, 'u16', 'TUNING', 'Kci (current-loop I)'),
+    (0x60F6, 0x03, 'u16', 'TUNING', 'Speed_Limit_Factor (I-loop)'),
+    (0x60F9, 0x01, 'u16', 'TUNING', 'Kvp[0] (velocity P)'),
+    (0x60F9, 0x02, 'u16', 'TUNING', 'Kvi[0] (velocity I)'),
+    (0x60F9, 0x07, 'u16', 'TUNING', 'Kvi/32 (fine velocity I)'),
+    (0x60F9, 0x03, 'u8',  'TUNING', 'Notch_N'),
+    (0x60F9, 0x05, 'u8',  'TUNING', 'Speed_Fb_N'),
+    (0x60FB, 0x01, 'i16', 'TUNING', 'Kpp[0] (position P)'),
+    (0x60FB, 0x02, 'i16', 'TUNING', 'K_Velocity_FF'),
+    (0x60FB, 0x03, 'i16', 'TUNING', 'K_Acc_FF'),
+    (0x60FB, 0x05, 'u16', 'TUNING', 'Pos_Filter_N'),
+    (0x6083, 0x00, 'u32', 'TUNING', 'Profile_Acc'),
+    (0x6084, 0x00, 'u32', 'TUNING', 'Profile_Dec'),
+    (0x6081, 0x00, 'u32', 'TUNING', 'Profile_Velocity'),
+    (0x607F, 0x00, 'u32', 'TUNING', 'Max_Speed'),
+    # ── COMMS — bus / node-identity / PDO ──
+    (0x100B, 0x00, 'u8',  'COMMS', 'Node-ID'),
+    (0x1005, 0x00, 'u32', 'COMMS', 'SYNC COB-ID'),
+    (0x1006, 0x00, 'u32', 'COMMS', 'Comm cycle period (us)'),
+    (0x100C, 0x00, 'u16', 'COMMS', 'Guard_Time (ms)'),
+    (0x100D, 0x00, 'u8',  'COMMS', 'Life_Time_Factor'),
+    (0x1016, 0x01, 'u32', 'COMMS', 'Heartbeat consumer'),
+    (0x1017, 0x00, 'u16', 'COMMS', 'Heartbeat producer (ms)'),
+    (0x1800, 0x01, 'u32', 'COMMS', 'TPDO1 COB-ID'),
+    (0x1801, 0x01, 'u32', 'COMMS', 'TPDO2 COB-ID'),
+    (0x1802, 0x01, 'u32', 'COMMS', 'TPDO3 COB-ID'),
+    (0x1803, 0x01, 'u32', 'COMMS', 'TPDO4 COB-ID'),
+]
+
+LIFT_OBJECTS = [
+    # ── FATAL ──
+    (0x60F7, 0x01, 'u16', 'FATAL', 'Brake resistance'),
+    (0x60F7, 0x02, 'u16', 'FATAL', 'Brake resistance power'),
+    (0x6510, 0x07, 'u16', 'FATAL', 'Voltage_Under (V)'),
+    (0x6510, 0x08, 'u16', 'FATAL', 'Chop_Voltage (V)'),
+    (0x6510, 0x09, 'u16', 'FATAL', 'Voltage_Over (V)'),
+    (0x2340, 0x0E, 'u8',  'FATAL', 'mt_disable (multi-turn prohibit)'),
+    (0x6073, 0x00, 'u16', 'FATAL', 'CMD_q_Max'),
+    (0x6410, 0x11, 'u16', 'FATAL', 'Brake duty cycle'),
+    (0x6410, 0x12, 'u16', 'FATAL', 'Brake delay (ms)'),
+    (0x2340, 0x01, 'u8',  'FATAL', 'Step_Stop_Mode'),
+    (0x2340, 0x02, 'u16', 'FATAL', 'Step_Stop_Amp'),
+    # ── PERSIST ──
+    (0x6065, 0x00, 'u32', 'PERSIST', 'Max_Following_Error'),
+    (0x6067, 0x00, 'u32', 'PERSIST', 'Target_Pos_Window'),
+    (0x607D, 0x01, 'i32', 'PERSIST', 'Soft_Positive_Limit'),
+    (0x607D, 0x02, 'i32', 'PERSIST', 'Soft_Negative_Limit'),
+    (0x6098, 0x00, 'i8',  'PERSIST', 'Homing_Method'),
+    (0x6099, 0x05, 'u8',  'PERSIST', 'Home_Offset_Mode'),
+    (0x605A, 0x00, 'i16', 'PERSIST', 'Quick_Stop_Mode'),
+    (0x605B, 0x00, 'i16', 'PERSIST', 'Shutdown_Stop_Mode'),
+    (0x605C, 0x00, 'i16', 'PERSIST', 'Disable_Stop_Mode'),
+    (0x605D, 0x00, 'i16', 'PERSIST', 'Halt_Mode'),
+    (0x605E, 0x00, 'i16', 'PERSIST', 'Fault_Stop_Mode'),
+    (0x2010, 0x19, 'u8',  'PERSIST', 'Limit_Function'),
+    (0x2508, 0x03, 'u8',  'PERSIST', 'PD_CW (pulse-mode direction)'),
+    # ── TUNING ──
+    (0x60F9, 0x01, 'u16', 'TUNING', 'Kvp[0] (velocity P)'),
+    (0x60F9, 0x02, 'u16', 'TUNING', 'Kvi[0] (velocity I)'),
+    (0x60F9, 0x05, 'u8',  'TUNING', 'Speed_Fb_N'),
+    (0x60F9, 0x07, 'u16', 'TUNING', 'Kvi/32 (fine velocity I)'),
+    (0x60F9, 0x14, 'u16', 'TUNING', 'Zero_Speed_Time'),
+    (0x60FB, 0x01, 'i16', 'TUNING', 'Kpp[0] (position P)'),
+    (0x60FB, 0x02, 'i16', 'TUNING', 'K_Velocity_FF'),
+    (0x60FB, 0x03, 'i16', 'TUNING', 'K_Acc_FF'),
+    (0x60FB, 0x05, 'u16', 'TUNING', 'Pos_Filter_N'),
+    (0x2340, 0x04, 'u16', 'TUNING', 'Kvp[1] (gain set 2)'),
+    (0x2340, 0x05, 'u16', 'TUNING', 'Kvi[1] (gain set 2)'),
+    (0x2340, 0x06, 'u16', 'TUNING', 'Kpp[1] (gain set 2)'),
+    (0x2340, 0x07, 'u16', 'TUNING', 'Kvp[2] (gain set 3)'),
+    (0x2340, 0x08, 'u16', 'TUNING', 'Kvi[2] (gain set 3)'),
+    (0x2340, 0x09, 'u16', 'TUNING', 'Kpp[2] (gain set 3)'),
+    (0x2340, 0x0A, 'u16', 'TUNING', 'Kvp[3] (gain set 4)'),
+    (0x2340, 0x0B, 'u16', 'TUNING', 'Kvi[3] (gain set 4)'),
+    (0x2340, 0x0C, 'u16', 'TUNING', 'Kpp[3] (gain set 4)'),
+    (0x2340, 0x0D, 'u16', 'TUNING', 'gain-set select / band'),
+    (0x2340, 0x10, 'u16', 'TUNING', 'Auto_Tuning_Control'),
+    (0x6083, 0x00, 'u32', 'TUNING', 'Profile_Acc'),
+    (0x6084, 0x00, 'u32', 'TUNING', 'Profile_Dec'),
+    # ── COMMS ──
+    (0x100B, 0x00, 'u8',  'COMMS', 'Node-ID'),
+    (0x1005, 0x00, 'u32', 'COMMS', 'SYNC COB-ID'),
+    (0x1006, 0x00, 'u32', 'COMMS', 'Comm cycle period (us)'),
+    (0x100C, 0x00, 'u16', 'COMMS', 'Guard_Time (ms)'),
+    (0x100D, 0x00, 'u8',  'COMMS', 'Life_Time_Factor'),
+]
+
+_TIER_ORDER = ('FATAL', 'PERSIST', 'TUNING', 'COMMS')
+_TIER_COLOR = {'FATAL': _red, 'PERSIST': _yellow, 'TUNING': _cyan, 'COMMS': _grey}
+
+
+def _fmt_value(val, reason, as_hex):
+    if val is None:
+        return _red('N/A') if reason in ('timeout', 'ok') else _red(reason)
+    if as_hex:
+        h = f'0x{val & 0xFFFFFFFF:X}' if val >= 0 else f'{val}'
+        return f'{val} ({h})'
+    return str(val)
+
+
+def _obj_label(index, sub):
+    return f'0x{index:04X}:{sub:02X}'
+
+
+def _rjust(text, width):
+    """Right-justify to `width` visible columns, ignoring embedded ANSI codes."""
+    pad = width - len(_strip(text))
+    return (' ' * pad + text) if pad > 0 else text
+
+
+def _applies(index, node):
+    """Homing objects are steer-only on the AMR chassis."""
+    if index in _HOMING_INDEXES and node not in STEER_NODES:
+        return False
+    return True
+
+
+def read_amr(iface, nodes, as_hex):
+    print(_bold(f'\n══ AMR chassis — {iface} — nodes {", ".join(map(str, nodes))} ══'))
+    try:
+        sock = open_can_socket(iface)
+    except OSError as exc:
+        print(_red(f'  cannot open {iface}: {exc}'))
+        return
+    with sock:
+        name_w = max(len(o[4]) for o in AMR_OBJECTS)
+        col_w = 14 if as_hex else 9
+        header = f'  {"OBJECT":<11} {"NAME":<{name_w}} {"TYPE":<4} ' + \
+                 ' '.join(_rjust('n' + str(n), col_w) for n in nodes)
+        for tier in _TIER_ORDER:
+            rows = [o for o in AMR_OBJECTS if o[3] == tier]
+            if not rows:
+                continue
+            print('\n' + _TIER_COLOR[tier](_bold(f'  ── {tier} ──')))
+            print(_bold(header))
+            for index, sub, typ, _t, name in rows:
+                signed = _TYPE[typ][1]
+                cells = []
+                for n in nodes:
+                    if not _applies(index, n):
+                        cells.append(_rjust(_grey('—'), col_w))
+                        continue
+                    val, reason = sdo_read(sock, n, index, sub, signed)
+                    cells.append(_rjust(_fmt_value(val, reason, as_hex), col_w))
+                print(f'  {_obj_label(index, sub):<11} {name:<{name_w}} {typ:<4} ' + ' '.join(cells))
+
+
+def read_lift(iface, node, as_hex):
+    print(_bold(f'\n══ Liftkit — {iface} — node {node} ══'))
+    try:
+        sock = open_can_socket(iface)
+    except OSError as exc:
+        print(_red(f'  cannot open {iface}: {exc}'))
+        return
+    with sock:
+        name_w = max(len(o[4]) for o in LIFT_OBJECTS)
+        for tier in _TIER_ORDER:
+            rows = [o for o in LIFT_OBJECTS if o[3] == tier]
+            if not rows:
+                continue
+            print('\n' + _TIER_COLOR[tier](_bold(f'  ── {tier} ──')))
+            print(_bold(f'  {"OBJECT":<11} {"NAME":<{name_w}} {"TYPE":<4} {"VALUE":>18}'))
+            for index, sub, typ, _t, name in rows:
+                val, reason = sdo_read(sock, node, index, sub, _TYPE[typ][1])
+                cell = _rjust(_fmt_value(val, reason, as_hex), 18)
+                print(f'  {_obj_label(index, sub):<11} {name:<{name_w}} {typ:<4} {cell}')
+
+
+def _strip(s):
+    """Length of s without ANSI colour codes (for width-correct right-align)."""
+    out, i = [], 0
+    while i < len(s):
+        if s[i] == '\033':
+            while i < len(s) and s[i] != 'm':
+                i += 1
+            i += 1
+            continue
+        out.append(s[i])
+        i += 1
+    return ''.join(out)
+
+
+def main():
+    ap = argparse.ArgumentParser(description='Read configurable OD values from AMR + liftkit drives.')
+    ap.add_argument('--amr-iface', default=DEFAULT_AMR_IFACE, help='AMR CAN interface (default can0)')
+    ap.add_argument('--lift-iface', default=DEFAULT_LIFT_IFACE, help='liftkit CAN interface (default can1)')
+    ap.add_argument('--nodes', type=int, nargs='+', default=list(AMR_NODES),
+                    help='AMR node ids to read (default 1-6)')
+    ap.add_argument('--amr-only', action='store_true')
+    ap.add_argument('--lift-only', action='store_true')
+    ap.add_argument('--hex', action='store_true', help='also show values in hex')
+    args = ap.parse_args()
+
+    print(_bold('═' * 72))
+    print(_bold('  Configurable-OD Value Reader'))
+    print(_grey('  Pre-flight only — run before the ros2_canopen stack starts.'))
+    print(_bold('═' * 72))
+
+    if not args.lift_only:
+        read_amr(args.amr_iface, tuple(args.nodes), args.hex)
+    if not args.amr_only:
+        read_lift(args.lift_iface, LIFT_NODE, args.hex)
+
+    print(_grey('\n  N/A = no SDO response (node down, or object absent on this drive).'))
+    print(_grey('  —   = not applicable (homing objects are steer-only on the AMR).'))
+
+
+if __name__ == '__main__':
+    main()
