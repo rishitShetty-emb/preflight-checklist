@@ -1,0 +1,275 @@
+#!/usr/bin/env python3
+"""
+CANopen Liftkit Homing Script (home in place, NO motion)
+--------------------------------------------------------
+Homes the liftkit drive (node 7 on can1) at its CURRENT position over CANopen SDO.
+Run standalone, BEFORE the ros2_canopen stack starts.
+
+No sweep, no jog, no profile-position moves. The drive is never enabled in a motion
+mode: it is put into Homing mode (6) while still in "Ready to switch on", and only
+then enabled, so method 35 just zeroes the position where the axis already sits.
+
+Sequence:
+  pre-flight : 0x6099:03 Homing_Power_On  == 2   (fix + save + power-cycle if wrong)
+               0x6099:05 Home_Offset_Mode == 1   (fix + save + power-cycle if wrong)
+  homing     : clear fault -> 0x6098=35 -> mode 6 -> CW 0x06 -> encoder reset (0x2690=10)
+               -> CW 0x0F -> CW 0x1F -> check homing attained -> save (0x1010:01)
+
+Derived from the AMR steer-motor homing script (nodes 1-6 on can0).
+"""
+
+import argparse
+import sys
+import time
+
+import can
+
+# === CONFIGURATION ===
+LIFTKIT_NAME    = "Liftkit"
+LIFTKIT_NODE_ID = 7
+CAN_INTERFACE   = "can1"
+CAN_BUSTYPE     = "socketcan"
+
+# 0x6099:03 Homing_Power_On — must be 2.
+HOMING_POWERON_INDEX, HOMING_POWERON_SUB, HOMING_POWERON_EXPECTED = 0x6099, 0x03, 2
+# 0x6099:05 Home_Offset_Mode — must be 1.
+HOMING_OFFMODE_INDEX, HOMING_OFFMODE_SUB, HOMING_OFFMODE_EXPECTED = 0x6099, 0x05, 1
+# 0x6098:00 Homing_Method — must be 35 (home at current position). Takes effect on the
+# next homing command, so it is fixed inline without a power-cycle.
+HOMING_METHOD_INDEX, HOMING_METHOD_SUB, HOMING_METHOD_EXPECTED = 0x6098, 0x00, 35
+
+MODE_HOMING = 6
+
+# Statusword bits
+SW_OP_ENABLED     = 0x0004   # bit 2
+SW_FAULT          = 0x0008   # bit 3
+SW_TARGET_REACHED = 0x0400   # bit 10
+SW_HOMING_ATTAINED = 0x1000  # bit 12 (homing mode)
+SW_HOMING_ERROR   = 0x2000   # bit 13 (homing mode)
+
+SAVE_SIGNATURE = 0x65766173  # ASCII "save" -> 0x1010:01
+
+SDO_TX_BASE = 0x600
+SDO_RX_BASE = 0x580
+SDO_READ_RESPONSES = (0x43, 0x47, 0x4B, 0x4F)
+
+
+# ── SDO helpers ────────────────────────────────────────────────────────────────
+
+def _sdo_payload_write(index, subindex, value, size_bytes):
+    cmd = {1: 0x2F, 2: 0x2B, 4: 0x23}.get(size_bytes)
+    if cmd is None:
+        raise ValueError(f"Unsupported SDO size: {size_bytes}")
+    mask = (1 << (8 * size_bytes)) - 1
+    data = list((value & mask).to_bytes(size_bytes, "little")) + [0x00] * (4 - size_bytes)
+    return [cmd, index & 0xFF, (index >> 8) & 0xFF, subindex] + data
+
+
+def send_write_telegram(bus, node_id, index, subindex, value, size_bytes):
+    bus.send(can.Message(arbitration_id=SDO_TX_BASE + node_id,
+                         data=_sdo_payload_write(index, subindex, value, size_bytes),
+                         is_extended_id=False))
+    time.sleep(0.05)
+
+
+def send_read_telegram(bus, node_id, index, subindex, timeout=1.0, retries=3):
+    request = [0x40, index & 0xFF, (index >> 8) & 0xFF, subindex, 0, 0, 0, 0]
+    response_id = SDO_RX_BASE + node_id
+    for _ in range(retries):
+        bus.send(can.Message(arbitration_id=SDO_TX_BASE + node_id,
+                             data=request, is_extended_id=False))
+        deadline = time.time() + timeout
+        while (remaining := deadline - time.time()) > 0:
+            frame = bus.recv(timeout=remaining)
+            if frame is None:
+                break
+            if (frame.arbitration_id == response_id and len(frame.data) >= 8
+                    and frame.data[0] in SDO_READ_RESPONSES):
+                return frame
+            if frame.arbitration_id == response_id and frame.data[0] == 0x80:
+                abort = int.from_bytes(frame.data[4:8], "little")
+                print(f"  SDO abort 0x{abort:08X} on 0x{index:04X}:{subindex:02X}")
+                return None
+        time.sleep(0.02)
+    return None
+
+
+def decode_response(response, signed=False):
+    if response is None:
+        return None
+    size = {0x4F: 1, 0x4B: 2, 0x47: 3, 0x43: 4}.get(response.data[0], 4)
+    return int.from_bytes(response.data[4:4 + size], "little", signed=signed)
+
+
+def read_od(bus, node_id, index, subindex, signed=False):
+    return decode_response(send_read_telegram(bus, node_id, index, subindex), signed)
+
+
+def get_actual_position(bus, node_id):
+    return read_od(bus, node_id, 0x6064, 0x00, signed=True)
+
+
+def get_status_word(bus, node_id):
+    return read_od(bus, node_id, 0x6041, 0x00)
+
+
+def get_error_code(bus, node_id):
+    return read_od(bus, node_id, 0x603F, 0x00)
+
+
+def controlword(bus, node_id, value, settle=0.2):
+    send_write_telegram(bus, node_id, 0x6040, 0x00, value, 2)
+    time.sleep(settle)
+
+
+# ── OD verify / fix ─────────────────────────────────────────────────────────────
+
+def verify_and_fix_od(bus, node_id, index, subindex, expected, size_bytes):
+    """Returns 'pass' | 'fixed' | 'fail'."""
+    tag = f"[node {node_id}] 0x{index:04X}:{subindex:02X}"
+    current = read_od(bus, node_id, index, subindex, signed=True)
+    if current is None:
+        print(f"  {tag}  NO RESPONSE — cannot verify")
+        return "fail"
+    if current == expected:
+        print(f"  {tag}  = {current}  PASS")
+        return "pass"
+    print(f"  {tag}  = {current}, expected {expected} — FIXING")
+    send_write_telegram(bus, node_id, index, subindex, expected, size_bytes)
+    readback = read_od(bus, node_id, index, subindex, signed=True)
+    if readback != expected:
+        print(f"  {tag}  write failed (read back {readback}) — FAIL")
+        return "fail"
+    print(f"  {tag}  corrected to {expected}")
+    return "fixed"
+
+
+def preflight_od_check(bus, node_id):
+    """
+    0x6099:03 / 0x6099:05 need a power-cycle to apply. If either had to be corrected,
+    save to EEPROM and return False so the operator power-cycles and re-runs.
+    """
+    print("===== Pre-flight: homing OD check =====")
+    results = [
+        verify_and_fix_od(bus, node_id, HOMING_POWERON_INDEX, HOMING_POWERON_SUB,
+                          HOMING_POWERON_EXPECTED, 1),
+        verify_and_fix_od(bus, node_id, HOMING_OFFMODE_INDEX, HOMING_OFFMODE_SUB,
+                          HOMING_OFFMODE_EXPECTED, 1),
+    ]
+    if "fail" in results:
+        print("Pre-flight FAILED — could not verify/write. Check can1 wiring/power. Aborting.")
+        return False
+    if "fixed" in results:
+        print(f"  [node {node_id}] Saving corrected config to EEPROM...")
+        send_write_telegram(bus, node_id, 0x1010, 0x01, SAVE_SIGNATURE, 4)
+        time.sleep(1.5)
+        print("Pre-flight ODs corrected and saved. Power-cycle the liftkit drive, then re-run.")
+        return False
+    print("Pre-flight ODs correct — proceeding.\n")
+    return True
+
+
+# ── Homing ──────────────────────────────────────────────────────────────────────
+
+def clear_to_ready(bus, node_id, name, timeout=10):
+    """Clear any fault and leave the drive in 'Ready to switch on' (NOT enabled)."""
+    print(f"[{name}] Clearing faults (drive stays disabled)...")
+    controlword(bus, node_id, 0x06)
+    deadline = time.time() + timeout
+    while True:
+        err = get_error_code(bus, node_id)
+        sw = get_status_word(bus, node_id)
+        if err is not None and sw is not None and err == 0 and not (sw & SW_FAULT):
+            print(f"[{name}] Clean (SW=0x{sw:04X})")
+            return True
+        if time.time() > deadline:
+            print(f"[{name}] WARN: could not clear fault "
+                  f"(err={err} sw=0x{(sw or 0):04X}) — aborting")
+            return False
+        controlword(bus, node_id, 0x80)   # fault-reset rising edge
+        controlword(bus, node_id, 0x06)
+        time.sleep(0.3)
+
+
+def run_home_in_place(bus, node_id, name):
+    if not clear_to_ready(bus, node_id, name):
+        return None
+
+    if verify_and_fix_od(bus, node_id, HOMING_METHOD_INDEX, HOMING_METHOD_SUB,
+                         HOMING_METHOD_EXPECTED, 1) == "fail":
+        print(f"[{name}] Aborting — Homing_Method is not {HOMING_METHOD_EXPECTED}.")
+        return None
+
+    pos_before = get_actual_position(bus, node_id)
+    print(f"[{name}] Position before homing: {pos_before}")
+    print(f"[{name}] mode 6 -> 0x06 -> enc reset -> 0x0F -> 0x1F -> save")
+
+    send_write_telegram(bus, node_id, 0x6060, 0x00, MODE_HOMING, 1)   # Homing mode
+    time.sleep(0.2)
+    controlword(bus, node_id, 0x06)                                   # ready, not enabled
+    send_write_telegram(bus, node_id, 0x2690, 0x00, 10, 1)            # encoder data reset
+    time.sleep(0.5)
+    controlword(bus, node_id, 0x0F)                                   # enable
+    controlword(bus, node_id, 0x1F, settle=0.5)                       # execute homing
+
+    sw = get_status_word(bus, node_id)
+    if sw is None:
+        print(f"[{name}] WARN: no statusword after homing command")
+    elif sw & SW_HOMING_ERROR:
+        print(f"[{name}] ERROR: homing error bit set (SW=0x{sw:04X}) — NOT saving")
+        return None
+    elif sw & SW_HOMING_ATTAINED:
+        print(f"[{name}] Homing attained (SW=0x{sw:04X})")
+    else:
+        print(f"[{name}] WARN: homing-attained bit not set (SW=0x{sw:04X}) — check position below")
+
+    print(f"[{name}] Saving parameters to NVM...")
+    send_write_telegram(bus, node_id, 0x1010, 0x01, SAVE_SIGNATURE, 4)
+    time.sleep(1.5)
+
+    home_val = get_actual_position(bus, node_id)
+    print(f"[{name}] Home set. Actual position now: {home_val}")
+    return home_val
+
+
+# ── Entry point ─────────────────────────────────────────────────────────────────
+
+def main():
+    parser = argparse.ArgumentParser(
+        description="Home the liftkit (node 7) in place over CANopen — no motion.",
+        formatter_class=argparse.ArgumentDefaultsHelpFormatter)
+    parser.add_argument("--interface", "-i", default=CAN_INTERFACE, help="CAN interface")
+    parser.add_argument("--bustype", "-b", default=CAN_BUSTYPE, help="python-can bus type")
+    parser.add_argument("--node", "-n", type=int, default=LIFTKIT_NODE_ID, help="node ID")
+    parser.add_argument("--skip-preflight", action="store_true",
+                        help="skip the 0x6099:03 / 0x6099:05 check")
+    parser.add_argument("--yes", "-y", action="store_true", help="skip confirmation prompt")
+    args = parser.parse_args()
+
+    print(f"\nInterface : {args.interface} ({args.bustype})")
+    print(f"Node      : {args.node} ({LIFTKIT_NAME})")
+    print("Action    : home at CURRENT position (no motion)\n")
+
+    if not args.yes:
+        if input("Liftkit is at the desired zero position? [y/N] ").strip().lower() != "y":
+            print("Aborted.")
+            sys.exit(1)
+
+    try:
+        with can.interface.Bus(interface=args.bustype, channel=args.interface) as bus:
+            if args.skip_preflight:
+                print("Skipping pre-flight OD check (--skip-preflight).\n")
+            elif not preflight_od_check(bus, args.node):
+                sys.exit(1)
+            home_val = run_home_in_place(bus, args.node, LIFTKIT_NAME)
+    except KeyboardInterrupt:
+        print("\nKeyboard interrupt — stopped.")
+        sys.exit(0)
+
+    print("\n===== Final Home Value =====")
+    print(f"  {LIFTKIT_NAME}: {home_val if home_val is not None else 'N/A'}")
+    sys.exit(0 if home_val is not None else 1)
+
+
+if __name__ == "__main__":
+    main()
