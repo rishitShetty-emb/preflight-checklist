@@ -290,9 +290,65 @@ def jog_relative(bus, node_id, name, mm):
 
 # ── Entry point ─────────────────────────────────────────────────────────────────
 
+MENU = f"""
+Liftkit — choose an action:
+  1) Home in place   (zero at current position, no motion)
+  2) Jog up/down     (relative move, Profile Position, +/-{MAX_JOG_MM:.0f} mm, {JOG_PROFILE_RPM} RPM)
+  q) Quit
+"""
+
+
+def action_home(bus, args):
+    if not args.yes:
+        if input("Liftkit at the desired zero position? [y/N] ").strip().lower() != "y":
+            print("Skipped.")
+            return
+    if args.skip_preflight:
+        print("Skipping pre-flight OD check (--skip-preflight).\n")
+    elif not preflight_od_check(bus, args.node):
+        return
+    run_home_in_place(bus, args.node, LIFTKIT_NAME)
+
+
+def action_jog(bus, args, mm):
+    if abs(mm) > MAX_JOG_MM:
+        print(f"Jog {mm:+.1f} mm exceeds the +/-{MAX_JOG_MM:.0f} mm cap.")
+        return
+    if not args.yes:
+        if input(f"Move liftkit {mm:+.1f} mm now — area clear? [y/N] ").strip().lower() != "y":
+            print("Skipped.")
+            return
+    jog_relative(bus, args.node, LIFTKIT_NAME, mm)
+
+
+def prompt_jog_mm():
+    raw = input(f"Jog how many mm (+ up / - down, max +/-{MAX_JOG_MM:.0f}): ").strip()
+    try:
+        return float(raw)
+    except ValueError:
+        print("Not a number.")
+        return None
+
+
+def menu_loop(bus, args):
+    """Interactive loop — jog as many times as needed, then home, then quit."""
+    while True:
+        choice = input(MENU + "> ").strip().lower()
+        if choice in ("q", "quit", "3"):
+            return
+        if choice == "1":
+            action_home(bus, args)
+        elif choice == "2":
+            mm = prompt_jog_mm()
+            if mm is not None:
+                action_jog(bus, args, mm)
+        else:
+            print("Pick 1, 2, or q.")
+
+
 def main():
     parser = argparse.ArgumentParser(
-        description="Home the liftkit (node 7) in place over CANopen — no motion.",
+        description="Liftkit (node 7) homing + jog over CANopen.",
         formatter_class=argparse.ArgumentDefaultsHelpFormatter)
     parser.add_argument("--interface", "-i", default=CAN_INTERFACE, help="CAN interface")
     parser.add_argument("--bustype", "-b", default=CAN_BUSTYPE, help="python-can bus type")
@@ -300,52 +356,24 @@ def main():
     parser.add_argument("--skip-preflight", action="store_true",
                         help="skip the 0x6099:03 / 0x6099:05 check")
     parser.add_argument("--jog", type=float, metavar="MM",
-                        help=f"move relative MM mm (+ up / - down), capped +/-{MAX_JOG_MM:.0f}; "
-                             "no homing")
-    parser.add_argument("--yes", "-y", action="store_true", help="skip confirmation prompt")
+                        help=f"non-interactive: jog MM mm (+/-{MAX_JOG_MM:.0f}) and exit, no menu")
+    parser.add_argument("--yes", "-y", action="store_true", help="skip confirmation prompts")
     args = parser.parse_args()
 
     print(f"\nInterface : {args.interface} ({args.bustype})")
     print(f"Node      : {args.node} ({LIFTKIT_NAME})")
 
-    if args.jog is not None:
-        if abs(args.jog) > MAX_JOG_MM:
-            print(f"Jog {args.jog:+.1f} mm exceeds the +/-{MAX_JOG_MM:.0f} mm cap. Aborted.")
-            sys.exit(1)
-        print(f"Action    : JOG {args.jog:+.1f} mm (relative, Profile Position, {JOG_PROFILE_RPM} RPM)\n")
-        if not args.yes:
-            if input(f"Move liftkit {args.jog:+.1f} mm now — area clear? [y/N] ").strip().lower() != "y":
-                print("Aborted.")
-                sys.exit(1)
-        try:
-            with can.interface.Bus(interface=args.bustype, channel=args.interface) as bus:
-                pos = jog_relative(bus, args.node, LIFTKIT_NAME, args.jog)
-        except KeyboardInterrupt:
-            print("\nKeyboard interrupt — stopped.")
-            sys.exit(0)
-        sys.exit(0 if pos is not None else 1)
-
-    print("Action    : home at CURRENT position (no motion)\n")
-
-    if not args.yes:
-        if input("Liftkit is at the desired zero position? [y/N] ").strip().lower() != "y":
-            print("Aborted.")
-            sys.exit(1)
-
     try:
         with can.interface.Bus(interface=args.bustype, channel=args.interface) as bus:
-            if args.skip_preflight:
-                print("Skipping pre-flight OD check (--skip-preflight).\n")
-            elif not preflight_od_check(bus, args.node):
-                sys.exit(1)
-            home_val = run_home_in_place(bus, args.node, LIFTKIT_NAME)
+            if args.jog is not None:            # non-interactive single jog
+                action_jog(bus, args, args.jog)
+            else:
+                menu_loop(bus, args)
     except KeyboardInterrupt:
         print("\nKeyboard interrupt — stopped.")
         sys.exit(0)
 
-    print("\n===== Final Home Value =====")
-    print(f"  {LIFTKIT_NAME}: {home_val if home_val is not None else 'N/A'}")
-    sys.exit(0 if home_val is not None else 1)
+    sys.exit(0)
 
 
 if __name__ == "__main__":
