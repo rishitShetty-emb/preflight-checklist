@@ -340,8 +340,12 @@ def menu_loop(bus, args):
             action_home(bus, args)
         elif choice == "2":
             mm = prompt_jog_mm()
-            if mm is not None:
-                action_jog(bus, args, mm)
+            if mm is None:
+                continue
+            if abs(mm) > MAX_JOG_MM:
+                print(f"Jog {mm:+.1f} mm exceeds the +/-{MAX_JOG_MM:.0f} mm cap.")
+                continue
+            jog_relative(bus, args.node, LIFTKIT_NAME, mm)   # entering mm is the go
         else:
             print("Pick 1, 2, or q.")
 
